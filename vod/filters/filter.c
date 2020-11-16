@@ -3,10 +3,12 @@
 #include "rate_filter.h"
 #include "concat_clip.h"
 #include "../media_set.h"
+#include "../segmenter.h"
 
 // typedefs
 typedef struct {
 	request_context_t* request_context;
+	vod_uint_t manifest_duration_policy;
 	media_sequence_t* sequence;
 	media_clip_filtered_t* output_clip;
 	media_track_t* output_track;
@@ -25,6 +27,8 @@ typedef struct {
 	media_clip_filtered_t* output_clip;
 	media_track_t* cur_track;
 	void* audio_filter;
+	uint32_t max_frame_count;
+	uint32_t output_codec_id;
 } apply_filters_state_t;
 
 static void
@@ -35,7 +39,7 @@ filter_get_clip_track_count(media_clip_t* clip, uint32_t* track_count)
 	media_clip_t** cur_source;
 	media_clip_t** sources_end;
 
-	if (clip->type == MEDIA_CLIP_SOURCE)
+	if (media_clip_is_source(clip->type))
 	{
 		source = vod_container_of(clip, media_clip_source_t, base);
 		for (cur_track = source->track_array.first_track;
@@ -69,15 +73,36 @@ filter_copy_track_to_clip(
 	media_track_t* track)
 {
 	media_track_t* output_track = state->output_track;
+	media_track_t** ref_track = state->output_clip->ref_track;
 	uint32_t media_type;
 
 	*output_track = *track;
 
 	media_type = output_track->media_info.media_type;
-	if (state->output_clip->longest_track[media_type] == NULL ||
-		state->output_clip->longest_track[media_type]->media_info.duration_millis < output_track->media_info.duration_millis)
+	if (ref_track[media_type] == NULL)
+	{ 
+		ref_track[media_type] = output_track;
+	}
+	else
 	{
-		state->output_clip->longest_track[media_type] = output_track;
+		switch (state->manifest_duration_policy)
+		{
+		case MDP_MAX:
+			if (output_track->media_info.duration_millis > ref_track[media_type]->media_info.duration_millis)
+			{
+				ref_track[media_type] = output_track;
+			}
+			break;
+
+		case MDP_MIN:
+			if (output_track->media_info.duration_millis > 0 && 
+				(ref_track[media_type]->media_info.duration_millis == 0 ||
+				output_track->media_info.duration_millis < ref_track[media_type]->media_info.duration_millis))
+			{
+				ref_track[media_type] = output_track;
+			}
+			break;
+		}
 	}
 
 	if (output_track->media_info.media_type == MEDIA_TYPE_VIDEO)
@@ -125,7 +150,7 @@ filter_scale_video_tracks(filters_init_state_t* state, media_clip_t* clip, uint3
 	media_clip_t** sources_end;
 	vod_status_t rc;
 
-	if (clip->type == MEDIA_CLIP_SOURCE)
+	if (media_clip_is_source(clip->type))
 	{
 		source = vod_container_of(clip, media_clip_source_t, base);
 
@@ -226,7 +251,8 @@ filter_validate_consistent_codecs(
 vod_status_t
 filter_init_filtered_clips(
 	request_context_t* request_context,
-	media_set_t* media_set)
+	media_set_t* media_set,
+	bool_t parsed_frames)
 {
 	filters_init_state_t init_state;
 	media_clip_filtered_t* output_clip;
@@ -236,7 +262,6 @@ filter_init_filtered_clips(
 	media_clip_t* input_clip;
 	media_track_t* new_track;
 	uint32_t track_count[MEDIA_TYPE_COUNT];
-	uint32_t max_duration = 0;
 	uint32_t clip_index;
 	uint32_t media_type;
 	uint32_t cur_count;
@@ -275,7 +300,7 @@ filter_init_filtered_clips(
 			vod_memzero(track_count, sizeof(track_count));
 			filter_get_clip_track_count(*cur_clip, track_count);
 
-			if (cur_clip[0]->type != MEDIA_CLIP_SOURCE && track_count[MEDIA_TYPE_AUDIO] > 1)
+			if (!media_clip_is_source(cur_clip[0]->type) && track_count[MEDIA_TYPE_AUDIO] > 1)
 			{
 				track_count[MEDIA_TYPE_AUDIO] = 1;		// audio filtering supports only a single output track
 			}
@@ -349,6 +374,7 @@ filter_init_filtered_clips(
 		return VOD_ALLOC_FAILED;
 	}
 	init_state.request_context = request_context;
+	init_state.manifest_duration_policy = media_set->segmenter_conf->manifest_duration_policy;
 
 	media_set->filtered_tracks = init_state.output_track;
 
@@ -363,7 +389,7 @@ filter_init_filtered_clips(
 
 			output_clip->first_track = init_state.output_track;
 
-			vod_memzero(output_clip->longest_track, sizeof(output_clip->longest_track));
+			vod_memzero(output_clip->ref_track, sizeof(output_clip->ref_track));
 
 			// initialize the state
 			init_state.sequence = sequence;
@@ -371,7 +397,7 @@ filter_init_filtered_clips(
 			init_state.audio_reference_track = NULL;
 
 			// in case of source, just copy all tracks as is
-			if (input_clip->type == MEDIA_CLIP_SOURCE)
+			if (media_clip_is_source(input_clip->type))
 			{
 				filter_init_filtered_clip_from_source(&init_state, (media_clip_source_t*)input_clip);
 
@@ -402,7 +428,7 @@ filter_init_filtered_clips(
 						init_state.audio_reference_track_speed_denom);
 				}
 
-				if (init_state.has_audio_frames)
+				if (!parsed_frames || init_state.has_audio_frames)
 				{
 					new_track->source_clip = input_clip;
 					media_set->audio_filtering_needed = TRUE;
@@ -425,16 +451,6 @@ filter_init_filtered_clips(
 
 				continue;
 			}
-
-			// calculate the max duration, only relevant in case of single clip
-			for (media_type = 0; media_type < MEDIA_TYPE_COUNT; media_type++)
-			{
-				if (output_clip->longest_track[media_type] != NULL &&
-					output_clip->longest_track[media_type]->media_info.duration_millis > max_duration)
-				{
-					max_duration = output_clip->longest_track[media_type]->media_info.duration_millis;
-				}
-			}
 		}
 	}
 
@@ -442,7 +458,12 @@ filter_init_filtered_clips(
 
 	if (media_set->timing.durations == NULL)
 	{
-		media_set->timing.total_duration = max_duration;
+		media_set->timing.total_duration = segmenter_get_total_duration(
+				media_set->segmenter_conf,
+				media_set,
+				media_set->sequences,
+				media_set->sequences_end,
+				MEDIA_TYPE_NONE);
 	}
 
 	return VOD_OK;
@@ -453,6 +474,8 @@ filter_init_state(
 	request_context_t* request_context,
 	read_cache_state_t* read_cache_state,
 	media_set_t* media_set,
+	uint32_t max_frame_count,
+	uint32_t output_codec_id,
 	void** context)
 {
 	apply_filters_state_t* state;
@@ -471,6 +494,8 @@ filter_init_state(
 	state->sequence = media_set->sequences;
 	state->output_clip = state->sequence->filtered_clips;
 	state->cur_track = state->output_clip->first_track;
+	state->max_frame_count = max_frame_count;
+	state->output_codec_id = output_codec_id;
 	state->audio_filter = NULL;
 
 	*context = state;
@@ -533,6 +558,8 @@ filter_run_state_machine(void* context)
 			state->sequence,
 			state->cur_track->source_clip,
 			state->cur_track,
+			state->max_frame_count,
+			state->output_codec_id,
 			&cache_buffer_count,
 			&state->audio_filter);
 		if (rc != VOD_OK)

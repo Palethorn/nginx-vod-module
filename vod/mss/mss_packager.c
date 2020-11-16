@@ -1,5 +1,6 @@
 #include "mss_packager.h"
 #include "../mp4/mp4_defs.h"
+#include "../mp4/mp4_fragment.h"
 #include "../manifest_utils.h"
 
 // constants
@@ -24,10 +25,10 @@
 	"  <StreamIndex Type=\"%s\" QualityLevels=\"%uD\" Chunks=\"%uD\" Url=\"QualityLevels({bitrate})/Fragments(%s={start time})\">\n"
 
 #define MSS_STREAM_INDEX_HEADER_LABEL \
-	"  <StreamIndex Type=\"%s\" Name=\"%V\" QualityLevels=\"%uD\" Chunks=\"%uD\" Url=\"QualityLevels({bitrate})/Fragments(%s={start time})\">\n"
+	"  <StreamIndex Type=\"%s\" Name=\"%V\" Language=\"%s\" QualityLevels=\"%uD\" Chunks=\"%uD\" Url=\"QualityLevels({bitrate})/Fragments(%s={start time})\">\n"
 
 #define MSS_STREAM_INDEX_HEADER_SUBTITLE \
-	"  <StreamIndex Type=\"text\" Name=\"%V\" QualityLevels=\"%uD\" Chunks=\"%uD\" Subtype=\"CAPT\" Url=\"QualityLevels({bitrate})/Fragments(text={start time})\">\n"
+	"  <StreamIndex Type=\"text\" Name=\"%V\" Language=\"%s\" QualityLevels=\"%uD\" Chunks=\"%uD\" Subtype=\"CAPT\" Url=\"QualityLevels({bitrate})/Fragments(text={start time})\">\n"
 
 #define MSS_VIDEO_QUALITY_LEVEL_HEADER \
 	"    <QualityLevel Index=\"%uD\" Bitrate=\"%uD\" FourCC=\"H264\" MaxWidth=\"%uD\" MaxHeight=\"%uD\" " \
@@ -85,7 +86,7 @@ typedef struct {
 	u_char flags[3];
 	u_char track_id[4];
 	u_char default_sample_flags[4];
-} tfhd_atom_t;
+} mss_tfhd_atom_t;
 
 typedef struct {
 	uint64_t timestamp;
@@ -111,20 +112,6 @@ static const char* stream_type_by_media_type[] = {
 	MSS_STREAM_TYPE_AUDIO,
 	MSS_STREAM_TYPE_TEXT
 };
-
-static u_char*
-mss_append_hex_string(u_char* p, const u_char* buffer, uint32_t buffer_size)
-{
-	const u_char* buffer_end = buffer + buffer_size;
-	static const u_char hex_chars[] = "0123456789ABCDEF";
-
-	for (; buffer < buffer_end; buffer++)
-	{
-		*p++ = hex_chars[*buffer >> 4];
-		*p++ = hex_chars[*buffer & 0x0F];
-	}
-	return p;
-}
 
 static u_char*
 mss_write_manifest_chunks(u_char* p, segment_durations_t* segment_durations)
@@ -438,9 +425,9 @@ mss_packager_build_manifest(
 	result_size +=
 		(sizeof(MSS_STREAM_INDEX_HEADER) - 1 + 2 * sizeof(MSS_STREAM_TYPE_VIDEO) + 2 * VOD_INT32_LEN +
 		sizeof(MSS_STREAM_INDEX_FOOTER)) * adaptation_sets.count[ADAPTATION_TYPE_VIDEO] + 
-		(sizeof(MSS_STREAM_INDEX_HEADER_LABEL) - 1 + 2 * sizeof(MSS_STREAM_TYPE_AUDIO) + 2 * VOD_INT32_LEN +
+		(sizeof(MSS_STREAM_INDEX_HEADER_LABEL) - 1 + LANG_ISO639_3_LEN + 2 * sizeof(MSS_STREAM_TYPE_AUDIO) + 2 * VOD_INT32_LEN +
 		sizeof(MSS_STREAM_INDEX_FOOTER)) * adaptation_sets.count[ADAPTATION_TYPE_AUDIO] + 
-		(sizeof(MSS_STREAM_INDEX_HEADER_SUBTITLE) - 1 + 2 * VOD_INT32_LEN +
+		(sizeof(MSS_STREAM_INDEX_HEADER_SUBTITLE) - 1 + LANG_ISO639_3_LEN + 2 * VOD_INT32_LEN +
 		sizeof(MSS_STREAM_INDEX_FOOTER)) * adaptation_sets.count[ADAPTATION_TYPE_SUBTITLE];
 
 	// add the quality levels
@@ -498,19 +485,20 @@ mss_packager_build_manifest(
 		switch (media_type)
 		{
 		case MEDIA_TYPE_AUDIO:
-			if (adaptation_sets.count[ADAPTATION_TYPE_AUDIO] > 1)
+			if (adaptation_sets.multi_audio)
 			{
 				cur_track = *adaptation_set->first;
 				p = vod_sprintf(p,
 					MSS_STREAM_INDEX_HEADER_LABEL,
 					MSS_STREAM_TYPE_AUDIO,
 					&cur_track->media_info.label,
+					lang_get_rfc_5646_name(cur_track->media_info.language),
 					adaptation_set->count,
 					segment_durations[adaptation_set->type].segment_count,
 					MSS_STREAM_TYPE_AUDIO);
 				break;
 			}
-			// fallthrough
+			// fall through
 
 		case MEDIA_TYPE_VIDEO:
 			p = vod_sprintf(p,
@@ -526,6 +514,7 @@ mss_packager_build_manifest(
 			p = vod_sprintf(p,
 				MSS_STREAM_INDEX_HEADER_SUBTITLE,
 				&cur_track->media_info.label,
+				lang_get_rfc_5646_name(cur_track->media_info.language),
 				adaptation_set->count,
 				segment_durations[adaptation_set->type].segment_count);
 			break;
@@ -586,7 +575,7 @@ mss_packager_build_manifest(
 				continue;
 			}
 
-			p = mss_append_hex_string(p, cur_track->media_info.extra_data.data, cur_track->media_info.extra_data.len);
+			p = vod_append_hex_string(p, cur_track->media_info.extra_data.data, cur_track->media_info.extra_data.len);
 
 			p = vod_copy(p, MSS_QUALITY_LEVEL_FOOTER, sizeof(MSS_QUALITY_LEVEL_FOOTER) - 1);
 		}
@@ -629,7 +618,7 @@ mss_packager_build_manifest(
 static u_char*
 mss_write_tfhd_atom(u_char* p, uint32_t track_id, uint32_t flags)
 {
-	size_t atom_size = ATOM_HEADER_SIZE + sizeof(tfhd_atom_t);
+	size_t atom_size = ATOM_HEADER_SIZE + sizeof(mss_tfhd_atom_t);
 
 	write_atom_header(p, atom_size, 't', 'f', 'h', 'd');
 	write_be32(p, 0x20);		// default sample flags
@@ -721,11 +710,11 @@ mss_packager_build_fragment_header(
 
 	// calculate sizes
 	mdat_atom_size = ATOM_HEADER_SIZE + sequence->total_frame_size;
-	trun_atom_size = mp4_builder_get_trun_atom_size(media_type, sequence->total_frame_count);
+	trun_atom_size = mp4_fragment_get_trun_atom_size(media_type, sequence->total_frame_count);
 
 	traf_atom_size =
 		ATOM_HEADER_SIZE +
-		ATOM_HEADER_SIZE + sizeof(tfhd_atom_t) +
+		ATOM_HEADER_SIZE + sizeof(mss_tfhd_atom_t) +
 		trun_atom_size +
 		ATOM_HEADER_SIZE + sizeof(uuid_tfxd_atom_t) + 
 		extra_traf_atoms_size;
@@ -766,7 +755,7 @@ mss_packager_build_fragment_header(
 	write_atom_header(p, moof_atom_size, 'm', 'o', 'o', 'f');
 
 	// moof.mfhd
-	p = mp4_builder_write_mfhd_atom(p, segment_index);
+	p = mp4_fragment_write_mfhd_atom(p, segment_index);
 
 	// moof.traf
 	write_atom_header(p, traf_atom_size, 't', 'r', 'a', 'f');
@@ -784,10 +773,16 @@ mss_packager_build_fragment_header(
 	}
 
 	// moof.traf.trun
-	p = mp4_builder_write_trun_atom(
-		p,
-		sequence,
-		moof_atom_size + ATOM_HEADER_SIZE);
+	switch (sequence->media_type)
+	{
+	case MEDIA_TYPE_VIDEO:
+		p = mp4_fragment_write_video_trun_atom(p, sequence, moof_atom_size + ATOM_HEADER_SIZE, 0);
+		break;
+
+	case MEDIA_TYPE_AUDIO:
+		p = mp4_fragment_write_audio_trun_atom(p, sequence, moof_atom_size + ATOM_HEADER_SIZE);
+		break;
+	}
 
 	// moof.traf.tfxd
 	mss_get_segment_timing_info(sequence, &timing_info);

@@ -3,6 +3,7 @@
 #include "hds_amf0_encoder.h"
 #include "../manifest_utils.h"
 #include "../mp4/mp4_defs.h"
+#include "../mp4/mp4_write_stream.h"
 #include "../udrm.h"
 
 // manifest constants
@@ -389,7 +390,8 @@ hds_packager_build_manifest(
 	rc = manifest_utils_get_adaptation_sets(
 		request_context, 
 		media_set, 
-		ADAPTATION_SETS_FLAG_FORCE_MUXED | 
+		ADAPTATION_SETS_FLAG_MUXED | 
+		ADAPTATION_SETS_FLAG_EXCLUDE_MUXED_AUDIO |
 		ADAPTATION_SETS_FLAG_SINGLE_LANG_TRACK | 
 		ADAPTATION_SETS_FLAG_AVOID_AUDIO_ONLY,
 		&adaptation_sets);
@@ -412,7 +414,7 @@ hds_packager_build_manifest(
 	result_size = 
 		sizeof(HDS_MANIFEST_HEADER) - 1 + manifest_id->len + 
 		sizeof(HDS_MANIFEST_HEADER_BASE_URL) - 1 + base_url->len +
-		sizeof(HDS_MANIFEST_HEADER_LANG) - 1 + LANG_ISO639_2_LEN +
+		sizeof(HDS_MANIFEST_HEADER_LANG) - 1 + LANG_ISO639_3_LEN +
 		sizeof(HDS_MANIFEST_FOOTER);
 
 	switch (media_set->type)
@@ -443,7 +445,7 @@ hds_packager_build_manifest(
 
 	result_size +=
 		(vod_max(sizeof(HDS_MEDIA_HEADER_PREFIX_VIDEO) - 1 + 3 * VOD_INT32_LEN, 
-			sizeof(HDS_MEDIA_HEADER_PREFIX_AUDIO_LANG) - 1 + VOD_INT32_LEN + LANG_ISO639_2_LEN) +
+			sizeof(HDS_MEDIA_HEADER_PREFIX_AUDIO_LANG) - 1 + VOD_INT32_LEN + LANG_ISO639_3_LEN) +
 		conf->fragment_file_name_prefix.len +
 		MANIFEST_UTILS_TRACKS_SPEC_MAX_SIZE + 1 +		// 1 = -
 		sizeof(HDS_MEDIA_HEADER_SUFFIX_DRM) - 1 + 2 * VOD_INT32_LEN +
@@ -570,7 +572,7 @@ hds_packager_build_manifest(
 
 		p = vod_sprintf(p, HDS_MANIFEST_HEADER_LANG, 
 			&track->media_info.label,
-			lang_get_iso639_2t_name(track->media_info.language));
+			lang_get_iso639_3_name(track->media_info.language));
 	}
 
 	// bootstrap tags
@@ -696,12 +698,12 @@ hds_packager_build_manifest(
 			else
 			{
 				bitrate = tracks[MEDIA_TYPE_AUDIO]->media_info.bitrate;
-				if (adaptation_sets.total_count > 1 && adaptation_set > adaptation_sets.first)
+				if (adaptation_sets.multi_audio && adaptation_set > adaptation_sets.first)
 				{
 					p = vod_sprintf(p, HDS_MEDIA_HEADER_PREFIX_AUDIO_LANG,
 						bitrate / 1000, 
 						&tracks[MEDIA_TYPE_AUDIO]->media_info.label, 
-						lang_get_iso639_2t_name(tracks[MEDIA_TYPE_AUDIO]->media_info.language));
+						lang_get_iso639_3_name(tracks[MEDIA_TYPE_AUDIO]->media_info.language));
 				}
 				else
 				{

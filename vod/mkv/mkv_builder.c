@@ -3,6 +3,10 @@
 #include "../write_stream.h"
 #include "../udrm.h"
 
+#if (VOD_HAVE_OPENSSL_EVP)
+#include "../mp4/mp4_aes_ctr.h"
+#endif // VOD_HAVE_OPENSSL_EVP
+
 // constants
 #define EBML_MAX_NUM_SIZE (8)
 #define EBML_ID_SIZE (4)
@@ -84,7 +88,7 @@ typedef struct {
 	write_buffer_state_t write_buffer;
 	mp4_aes_ctr_state_t cipher;
 	u_char iv[MP4_AES_CTR_IV_SIZE];
-#endif //(VOD_HAVE_OPENSSL_EVP)
+#endif // VOD_HAVE_OPENSSL_EVP
 
 	media_sequence_t* sequence;
 	media_clip_filtered_t* cur_clip;
@@ -95,6 +99,7 @@ typedef struct {
 	bool_t frame_started;
 	uint64_t relative_dts;
 	uint32_t timescale;
+	bool_t key_frame;
 	u_char* frame_headers;
 } mkv_fragment_writer_state_t;
 
@@ -520,6 +525,7 @@ mkv_builder_init_track(mkv_fragment_writer_state_t* state, media_track_t* track)
 	state->cur_frame_part = track->frames;
 	state->cur_frame = track->frames.first_frame;
 	state->timescale = track->media_info.timescale;
+	state->key_frame = (track->media_info.media_type == MEDIA_TYPE_AUDIO);
 
 	if (!state->reuse_buffers)
 	{
@@ -557,7 +563,7 @@ mkv_builder_frame_writer_init(
 	u_char* p;
 #if (VOD_HAVE_OPENSSL_EVP)
 	vod_status_t rc;
-#endif //(VOD_HAVE_OPENSSL_EVP)
+#endif // VOD_HAVE_OPENSSL_EVP
 
 	frame_header_size = frame_header_size_by_enc_type[encryption_type];
 
@@ -674,7 +680,7 @@ mkv_builder_frame_writer_init(
 		vod_memcpy(state->iv, iv, sizeof(state->iv));
 	}
 	else
-#endif //(VOD_HAVE_OPENSSL_EVP)
+#endif // VOD_HAVE_OPENSSL_EVP
 	{
 		state->frame_headers = vod_alloc(request_context->pool, frame_headers_size);
 		if (state->frame_headers == NULL)
@@ -744,7 +750,11 @@ mkv_builder_write_frame_header(mkv_fragment_writer_state_t* state)
 			return rc;
 		}
 
-		p = mkv_builder_write_clear_frame_header(p, data_size, timecode, cur_frame->key_frame);
+		p = mkv_builder_write_clear_frame_header(
+			p, 
+			data_size, 
+			timecode, 
+			cur_frame->key_frame || state->key_frame);
 
 		*p++ = 0x01;	// encrypted
 		p = vod_copy(p, state->iv, MP4_AES_CTR_IV_SIZE);
@@ -753,12 +763,16 @@ mkv_builder_write_frame_header(mkv_fragment_writer_state_t* state)
 		mp4_aes_ctr_increment_be64(state->iv);
 	}
 	else
-#endif //(VOD_HAVE_OPENSSL_EVP)
+#endif // VOD_HAVE_OPENSSL_EVP
 	{
 		// write to frame_headers
 		p = state->frame_headers;
 
-		p = mkv_builder_write_clear_frame_header(p, data_size, timecode, cur_frame->key_frame);
+		p = mkv_builder_write_clear_frame_header(
+			p, 
+			data_size, 
+			timecode, 
+			cur_frame->key_frame || state->key_frame);
 
 		if (state->encryption_type == MKV_CLEAR_LEAD)
 		{
@@ -805,7 +819,7 @@ mkv_builder_start_frame(mkv_fragment_writer_state_t* state)
 					return rc;
 				}
 			}
-#endif //(VOD_HAVE_OPENSSL_EVP)
+#endif // VOD_HAVE_OPENSSL_EVP
 
 			return VOD_OK;
 		}
@@ -822,7 +836,7 @@ mkv_builder_start_frame(mkv_fragment_writer_state_t* state)
 	rc = state->cur_frame_part.frames_source->start_frame(
 		state->cur_frame_part.frames_source_context,
 		state->cur_frame, 
-		ULLONG_MAX);
+		NULL);
 	if (rc != VOD_OK)
 	{
 		return rc;
@@ -890,7 +904,7 @@ mkv_builder_frame_writer_process(void* context)
 				read_size);
 		}
 		else
-#endif //(VOD_HAVE_OPENSSL_EVP)
+#endif // VOD_HAVE_OPENSSL_EVP
 		{
 			rc = state->write_callback(state->write_context, read_buffer, read_size);
 		}

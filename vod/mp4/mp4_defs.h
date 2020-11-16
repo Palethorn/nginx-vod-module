@@ -35,6 +35,7 @@
 #define ATOM_NAME_AVCC (0x43637661)		// advanced video codec configuration
 #define ATOM_NAME_HVCC (0x43637668)		// high efficiency video codec configuration
 #define ATOM_NAME_VPCC (0x43637076)		// vp9 codec configuration
+#define ATOM_NAME_AV1C (0x43317661)		// av1 codec configuration
 #define ATOM_NAME_ESDS (0x73647365)		// elementary stream description
 #define ATOM_NAME_DAC3 (0x33636164)
 #define ATOM_NAME_DEC3 (0x33636564)
@@ -47,6 +48,7 @@
 #define ATOM_NAME_CMOV (0x766f6d63)		// compressed movie
 #define ATOM_NAME_DCOM (0x6d6f6364)		// data compression
 #define ATOM_NAME_CMVD (0x64766d63)		// compressed movie data
+#define ATOM_NAME_DOPS (0x73704f64)
 
 #define ATOM_NAME_NULL (0x00000000)
 
@@ -69,10 +71,18 @@
 // vp9 4cc tags
 #define FORMAT_VP09    (0x39307076)
 
-// aac 4cc tag
+// av1 4cc tags
+#define FORMAT_AV1     (0x31307661)
+
+// audio 4cc tags
 #define FORMAT_MP4A    (0x6134706d)
 #define FORMAT_AC3     (0x332d6361)
 #define FORMAT_EAC3    (0x332d6365)
+#define FORMAT_OPUS    (0x7375704f)
+
+// encryption schemes
+#define SCHEME_TYPE_CENC (0x63656e63)
+#define SCHEME_TYPE_CBCS (0x63626373)
 
 // MP4 constants from ffmpeg
 #define MP4ODescrTag				0x01
@@ -339,6 +349,13 @@ typedef struct {
 typedef struct {
 	u_char version[1];
 	u_char flags[3];
+	u_char system_id[16];
+	u_char data_size[4];
+} pssh_atom_t;
+
+typedef struct {
+	u_char version[1];
+	u_char flags[3];
 	u_char default_size[1];
 	u_char entries[4];
 } saiz_atom_t;
@@ -397,5 +414,55 @@ typedef struct {
 	u_char	rate_int[2];
 	u_char	rate_frac[2];
 } elst64_entry_t;
+
+typedef struct {
+	u_char version[1];
+	u_char flags[3];
+	u_char earliest_pres_time[4];
+} tfdt_atom_t;
+
+typedef struct {
+	u_char version[1];
+	u_char flags[3];
+	u_char earliest_pres_time[8];
+} tfdt64_atom_t;
+
+typedef struct {
+	u_char version[1];
+	u_char flags[3];
+	u_char track_id[4];
+} tfhd_atom_t;
+
+typedef struct {
+	u_char data_format[4];
+} frma_atom_t;
+
+typedef struct {
+	u_char version[1];
+	u_char flags[3];
+	u_char scheme_type[4];
+	u_char scheme_version[4];
+} schm_atom_t;
+
+typedef struct {
+	u_char version[1];
+	u_char flags[3];
+	u_char reserved[2];
+	u_char default_is_protected[1];
+	u_char default_per_sample_iv_size;
+	u_char default_kid[16];
+} tenc_atom_t;
+
+typedef struct {
+	u_char version[1];
+	u_char flags[3];
+	u_char reserved[1];
+	u_char crypt_skip_block[1];
+	u_char default_is_protected[1];
+	u_char default_per_sample_iv_size;
+	u_char default_kid[16];
+	u_char default_constant_iv_size;
+	u_char default_constant_iv[16];
+} tenc_v1_atom_t;
 
 #endif // __MP4_DEFS_H__

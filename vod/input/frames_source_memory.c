@@ -33,7 +33,7 @@ frames_source_memory_set_cache_slot_id(void* ctx, int cache_slot_id)
 }
 
 static vod_status_t
-frames_source_memory_start_frame(void* ctx, input_frame_t* frame, uint64_t min_offset)
+frames_source_memory_start_frame(void* ctx, input_frame_t* frame, read_cache_hint_t* cache_hint)
 {
 	frames_source_memory_state_t* state = ctx;
 
@@ -60,10 +60,17 @@ frames_source_memory_disable_buffer_reuse(void* ctx)
 {
 }
 
+static vod_status_t
+frames_source_memory_skip_frames(void* ctx, uint32_t skip_count)
+{
+	return VOD_OK;
+}
+
 // globals
 frames_source_t frames_source_memory = {
 	frames_source_memory_set_cache_slot_id,
 	frames_source_memory_start_frame,
 	frames_source_memory_read,
 	frames_source_memory_disable_buffer_reuse,
+	frames_source_memory_skip_frames,
 };

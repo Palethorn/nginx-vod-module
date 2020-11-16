@@ -1,15 +1,7 @@
 #include "media_format.h"
-
-static uint16_t channel_config_to_channel_count[] = {
-	0, // defined in AOT Specific Config
-	1, // front - center
-	2, // front - left, front - right
-	3, // front - center, front - left, front - right
-	4, // front - center, front - left, front - right, back - center
-	5, // front - center, front - left, front - right, back - left, back - right
-	6, // front - center, front - left, front - right, back - left, back - right, LFE - channel
-	8, // front - center, front - left, front - right, side - left, side - right, back - left, back - right, LFE - channel
-};
+#include "avc_hevc_parser.h"
+#include "avc_parser.h"
+#include "hevc_parser.h"
 
 vod_status_t
 media_format_finalize_track(
@@ -20,19 +12,63 @@ media_format_finalize_track(
 	codec_config_get_nal_units_t get_nal_units = NULL;
 	vod_status_t rc = VOD_OK;
 	u_char* new_extra_data;
-	uint8_t channel_config;
+	void* parser_ctx;
 
-	if (media_info->media_type == MEDIA_TYPE_AUDIO)
+	switch (media_info->media_type)
 	{
+	case MEDIA_TYPE_AUDIO:
 		// always save the audio extra data to support audio filtering
 		parse_type |= PARSE_FLAG_EXTRA_DATA;
+		break;
 
-		// derive the channel count from the codec config when possible
-		//	the channel count in the stsd atom is occasionally wrong
-		channel_config = media_info->u.audio.codec_config.channel_config;
-		if (channel_config > 0 && channel_config < vod_array_entries(channel_config_to_channel_count))
+	case MEDIA_TYPE_VIDEO:
+		if ((parse_type & PARSE_FLAG_CODEC_TRANSFER_CHAR) == 0)
 		{
-			media_info->u.audio.channels = channel_config_to_channel_count[channel_config];
+			break;
+		}
+
+		if (media_info->codec_id != VOD_CODEC_ID_AVC && media_info->codec_id != VOD_CODEC_ID_HEVC)
+		{
+			break;
+		}
+
+		rc = avc_hevc_parser_init_ctx(
+			request_context,
+			&parser_ctx);
+		if (rc != VOD_OK)
+		{
+			return rc;
+		}
+
+		if (media_info->codec_id == VOD_CODEC_ID_AVC)
+		{
+			rc = avc_parser_parse_extra_data(
+				parser_ctx,
+				&media_info->extra_data,
+				NULL,
+				NULL);
+			if (rc != VOD_OK)
+			{
+				return rc;
+			}
+
+			media_info->u.video.transfer_characteristics = avc_parser_get_transfer_characteristics(
+				parser_ctx);
+		}
+		else
+		{
+			rc = hevc_parser_parse_extra_data(
+				parser_ctx,
+				&media_info->extra_data,
+				NULL,
+				NULL);
+			if (rc != VOD_OK)
+			{
+				return rc;
+			}
+
+			media_info->u.video.transfer_characteristics = hevc_parser_get_transfer_characteristics(
+				parser_ctx);
 		}
 	}
 

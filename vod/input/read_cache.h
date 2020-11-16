@@ -23,16 +23,20 @@ typedef struct {
 	cache_buffer_t* target_buffer;
 	size_t buffer_count;
 	size_t buffer_size;
-	size_t alignment;
 	bool_t reuse_buffers;
 } read_cache_state_t;
+
+typedef struct {
+	uint64_t min_offset;
+	int min_offset_slot_id;
+} read_cache_hint_t;
 
 typedef struct {
 	int cache_slot_id;
 	struct media_clip_source_s* source;
 	uint64_t cur_offset;
 	uint64_t end_offset;
-	uint64_t min_offset;
+	read_cache_hint_t hint;
 } read_cache_request_t;
 
 typedef struct {
@@ -46,8 +50,7 @@ typedef struct {
 void read_cache_init(
 	read_cache_state_t* state, 
 	request_context_t* request_context, 
-	size_t buffer_size, 
-	size_t alignment);
+	size_t buffer_size);
 	
 vod_status_t read_cache_allocate_buffer_slots(
 	read_cache_state_t* state,

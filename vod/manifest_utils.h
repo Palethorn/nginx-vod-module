@@ -5,12 +5,15 @@
 #include "media_set.h"
 
 // constants
-#define ADAPTATION_SETS_FLAG_MUXED				(0x1)
-#define ADAPTATION_SETS_FLAG_FORCE_MUXED		(0x2)
-#define ADAPTATION_SETS_FLAG_SINGLE_LANG_TRACK	(0x4)
-#define ADAPTATION_SETS_FLAG_AVOID_AUDIO_ONLY	(0x8)
-#define ADAPTATION_SETS_FLAG_DEFAULT_LANG_LAST	(0x10)
-#define ADAPTATION_SETS_FLAG_MULTI_CODEC		(0x20)
+#define ADAPTATION_SETS_FLAG_MUXED					(0x1)
+#define ADAPTATION_SETS_FLAG_EXCLUDE_MUXED_AUDIO	(0x2)
+#define ADAPTATION_SETS_FLAG_SINGLE_LANG_TRACK		(0x4)
+#define ADAPTATION_SETS_FLAG_AVOID_AUDIO_ONLY		(0x8)
+#define ADAPTATION_SETS_FLAG_DEFAULT_LANG_LAST		(0x10)
+#define ADAPTATION_SETS_FLAG_MULTI_AUDIO_CODEC		(0x20)
+#define ADAPTATION_SETS_FLAG_MULTI_VIDEO_CODEC		(0x40)
+
+#define ADAPTATION_SETS_FLAG_MULTI_CODEC			(ADAPTATION_SETS_FLAG_MULTI_AUDIO_CODEC | ADAPTATION_SETS_FLAG_MULTI_VIDEO_CODEC)
 
 #define MANIFEST_UTILS_TRACKS_SPEC_MAX_SIZE (sizeof("-f-v-f-a") - 1 + VOD_INT32_LEN * 4)
 
@@ -37,6 +40,7 @@ typedef struct {
 	adaptation_set_t* first_by_type[ADAPTATION_TYPE_COUNT];
 	uint32_t count[ADAPTATION_TYPE_COUNT];
 	uint32_t total_count;
+	bool_t multi_audio;
 } adaptation_sets_t;
 
 // functions
@@ -45,7 +49,8 @@ vod_status_t manifest_utils_build_request_params_string(
 	uint32_t* has_tracks,
 	uint32_t segment_index,
 	uint32_t sequences_mask,
-	uint32_t* sequence_tracks_mask,
+	sequence_tracks_mask_t* sequence_tracks_mask,
+	sequence_tracks_mask_t* sequence_tracks_mask_end,
 	uint32_t* tracks_mask,
 	vod_str_t* result);
 

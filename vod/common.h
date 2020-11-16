@@ -19,6 +19,9 @@
 #define vod_is_bit_set(mask, index) (((mask)[(index) >> 3] >> ((index) & 7)) & 1)
 #define vod_set_bit(mask, index) (mask)[(index) >> 3] |= 1 << ((index) & 7)
 
+#define vod_no_flag_set(mask, f) (((mask) & (f)) == 0)
+#define vod_all_flags_set(mask, f) (((mask) & (f)) == (f))
+
 // Note: comparing the pointers since in the case of labels if both were derived by the language, 
 //		they will have the same pointer and we can skip the memcmp
 #define vod_str_equals(l1, l2) \
@@ -93,9 +96,15 @@ void vod_log_error(vod_uint_t level, vod_log_t *log, int err,
 #define VOD_MAX_SIZE_T_VALUE NGX_MAX_SIZE_T_VALUE
 #define VOD_MAX_OFF_T_VALUE NGX_MAX_OFF_T_VALUE
 
-#define VOD_HAVE_LIB_AV_CODEC NGX_HAVE_LIB_AV_CODEC 
+#define VOD_HAVE_LIB_AV_CODEC NGX_HAVE_LIB_AV_CODEC
 #define VOD_HAVE_LIB_AV_FILTER NGX_HAVE_LIB_AV_FILTER
+#define VOD_HAVE_LIB_SW_SCALE NGX_HAVE_LIB_SW_SCALE
 #define VOD_HAVE_OPENSSL_EVP NGX_HAVE_OPENSSL_EVP
+#define VOD_HAVE_LIBXML2 NGX_HAVE_LIBXML2
+#define VOD_HAVE_ICONV NGX_HAVE_ICONV
+#define VOD_HAVE_ZLIB NGX_HAVE_ZLIB
+
+#define VOD_DEBUG NGX_DEBUG
 
 #if (VOD_HAVE_LIB_AV_CODEC)
 #include <libavcodec/avcodec.h>
@@ -121,6 +130,7 @@ void vod_log_error(vod_uint_t level, vod_log_t *log, int err,
 #define  VOD_AGAIN      NGX_AGAIN
 
 #define vod_inline ngx_inline
+#define vod_cdecl ngx_cdecl
 
 // memory set/copy functions
 #define vod_memcpy(dst, src, n) ngx_memcpy(dst, src, n)
@@ -139,11 +149,16 @@ void vod_log_error(vod_uint_t level, vod_log_t *log, int err,
 // string functions
 #define vod_sprintf ngx_sprintf
 #define vod_snprintf ngx_snprintf
-#define vod_strncmp(s1, s2, n) ngx_strncmp(s1, s2, n)
-#define vod_strncasecmp(s1, s2, n) ngx_strncasecmp(s1, s2, n)
 #define vod_atoi(str, len) ngx_atoi(str, len)
 #define vod_atofp(str, len, point) ngx_atofp(str, len, point)
+#define vod_strstrn ngx_strstrn
+#define vod_strcmp ngx_strcmp
+#define vod_strlen ngx_strlen
+#define vod_strncmp(s1, s2, n) ngx_strncmp(s1, s2, n)
+#define vod_strncasecmp(s1, s2, n) ngx_strncasecmp(s1, s2, n)
 #define vod_pstrdup(pool, src) ngx_pstrdup(pool, src)
+#define vod_hextoi(line, n) ngx_hextoi(line, n)
+#define vod_escape_json(dst, src, size) ngx_escape_json(dst, src, size)
 
 // array functions
 #define vod_array_init(array, pool, n, size) ngx_array_init(array, pool, n, size)
@@ -171,10 +186,10 @@ void vod_log_error(vod_uint_t level, vod_log_t *log, int err,
 #define vod_hash_find(hash, key, name, len) ngx_hash_find(hash, key, name, len)
 
 // time functions
-#if (NGX_DEBUG)
-#define vod_time(request_context) (request_context->time > 0 ? request_context->time : ngx_time())
+#if (VOD_DEBUG)
+#define vod_time(request_context) ((request_context)->time > 0 ? (request_context)->time : (ngx_time() + (request_context)->time_offset))
 #else
-#define vod_time(request_context) ngx_time()
+#define vod_time(request_context) (ngx_time() + (request_context)->time_offset)
 #endif
 
 #define vod_gmtime(t, tp) ngx_gmtime(t, tp)
@@ -212,6 +227,8 @@ void vod_log_error(vod_uint_t level, vod_log_t *log, int err,
 #define vod_base64_decoded_length(len) ngx_base64_decoded_length(len)
 #define vod_crc32_short(p, len) ngx_crc32_short(p, len)
 
+#define VOD_MAX_ERROR_STR NGX_MAX_ERROR_STR
+
 #define VOD_LOG_STDERR            NGX_LOG_STDERR 
 #define VOD_LOG_EMERG             NGX_LOG_EMERG  
 #define VOD_LOG_ALERT             NGX_LOG_ALERT  
@@ -241,16 +258,13 @@ void vod_log_error(vod_uint_t level, vod_log_t *log, int err,
 #define vod_log_debug4(level, log, err, fmt, arg1, arg2, arg3, arg4) \
 		ngx_log_debug4(level, log, err, fmt, arg1, arg2, arg3, arg4)
 
-#if (NGX_DEBUG)
-#define VOD_DEBUG (1)
-#else
-#define VOD_DEBUG (0)
-#endif
+#define vod_errno ngx_errno
 
 typedef intptr_t bool_t;
 typedef ngx_int_t vod_status_t;
 typedef ngx_int_t vod_int_t;
 typedef ngx_uint_t vod_uint_t;
+typedef ngx_err_t vod_err_t;
 
 #endif	// VOD_STAND_ALONE
 
@@ -295,7 +309,10 @@ enum {
 	VOD_BAD_REQUEST,
 	VOD_BAD_MAPPING,
 	VOD_EXPIRED,
+	VOD_NO_STREAMS,
+	VOD_EMPTY_MAPPING,
 	VOD_NOT_FOUND,
+	VOD_REDIRECT,
 	VOD_ERROR_LAST,
 };
 
@@ -322,7 +339,8 @@ typedef struct {
 	vod_log_t *log;
 	buffer_pool_t* output_buffer_pool;
 	bool_t simulation_only;
-#if (NGX_DEBUG)
+	time_t time_offset;
+#if (VOD_DEBUG)
 	time_t time;
 #endif
 } request_context_t;
@@ -339,5 +357,7 @@ enum {
 int vod_get_int_print_len(uint64_t n);
 
 uint32_t vod_get_number_of_set_bits(uint32_t i);
+
+u_char* vod_append_hex_string(u_char* p, const u_char* buffer, uint32_t buffer_size);
 
 #endif // __COMMON_H__

@@ -3,9 +3,7 @@
 
 // includes
 #include <ngx_http.h>
-
-// macros
-#define NGINX_VOD_VERSION "1.10"
+#include <ngx_vod_version.h>
 
 // globals
 extern ngx_module_t  ngx_http_vod_module;
@@ -14,7 +12,7 @@ extern ngx_module_t  ngx_http_vod_module;
 ngx_int_t ngx_http_vod_handler(ngx_http_request_t *r);
 
 // variables
-ngx_int_t ngx_http_vod_add_variables(ngx_conf_t *cf);
+ngx_int_t ngx_http_vod_preconfiguration(ngx_conf_t *cf);
 
 // handlers
 ngx_int_t ngx_http_vod_local_request_handler(ngx_http_request_t *r);

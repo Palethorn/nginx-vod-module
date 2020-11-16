@@ -159,6 +159,7 @@ ngx_buffer_cache_init(ngx_shm_zone_t *shm_zone, void *data)
 	p = ngx_sprintf(cache->shpool->log_ctx, " in buffer cache \"%V\"%Z", &shm_zone->shm.name);
 
 	// allocate the shared cache state
+	p = ngx_align_ptr(p, sizeof(void *));
 	sh = (ngx_buffer_cache_sh_t*)p;
 	p += sizeof(*sh);
 	cache->sh = sh;
@@ -166,6 +167,7 @@ ngx_buffer_cache_init(ngx_shm_zone_t *shm_zone, void *data)
 	cache->shpool->data = sh;
 
 	// initialize fixed cache fields
+	p = ngx_align_ptr(p, sizeof(void *));
 	sh->entries_start = (ngx_buffer_cache_entry_t*)p;
 	sh->buffers_end = shm_zone->shm.addr + shm_zone->shm.size;
 	sh->access_time = 0;
@@ -194,7 +196,8 @@ ngx_buffer_cache_free_oldest_entry(ngx_buffer_cache_sh_t *cache, uint32_t expira
 
 	// verify the entry is not locked
 	entry = container_of(ngx_queue_head(&cache->used_queue), ngx_buffer_cache_entry_t, queue_node);
-	if (ngx_time() < entry->access_time + ENTRY_LOCK_EXPIRATION)
+	if (entry->ref_count > 0 &&
+		ngx_time() < entry->access_time + ENTRY_LOCK_EXPIRATION)
 	{
 		return NULL;
 	}
@@ -323,8 +326,8 @@ ngx_flag_t
 ngx_buffer_cache_fetch(
 	ngx_buffer_cache_t* cache,
 	u_char* key,
-	u_char** buffer,
-	size_t* buffer_size)
+	ngx_str_t* buffer,
+	uint32_t* token)
 {
 	ngx_buffer_cache_entry_t* entry;
 	ngx_buffer_cache_sh_t *sh = cache->sh;
@@ -348,12 +351,14 @@ ngx_buffer_cache_fetch(
 			sh->stats.fetch_bytes += entry->buffer_size;
 
 			// copy buffer pointer and size
-			*buffer = entry->start_offset;
-			*buffer_size = entry->buffer_size;
+			buffer->data = entry->start_offset;
+			buffer->len = entry->buffer_size;
+			*token = entry->write_time;
 
 			// Note: setting the access time of the entry and cache to prevent it 
 			//		from being freed while the caller uses the buffer
 			sh->access_time = entry->access_time = ngx_time();
+			(void)ngx_atomic_fetch_add(&entry->ref_count, 1);
 		}
 		else
 		{
@@ -365,6 +370,32 @@ ngx_buffer_cache_fetch(
 	ngx_shmtx_unlock(&cache->shpool->mutex);
 
 	return result;
+}
+
+void
+ngx_buffer_cache_release(
+	ngx_buffer_cache_t* cache,
+	u_char* key,
+	uint32_t token)
+{
+	ngx_buffer_cache_entry_t* entry;
+	ngx_buffer_cache_sh_t *sh = cache->sh;
+	uint32_t hash;
+
+	hash = ngx_crc32_short(key, BUFFER_CACHE_KEY_SIZE);
+
+	ngx_shmtx_lock(&cache->shpool->mutex);
+
+	if (!sh->reset)
+	{
+		entry = ngx_buffer_cache_rbtree_lookup(&sh->rbtree, key, hash);
+		if (entry != NULL && entry->state == CES_READY && (uint32_t)entry->write_time == token)
+		{
+			(void)ngx_atomic_fetch_add(&entry->ref_count, -1);
+		}
+	}
+
+	ngx_shmtx_unlock(&cache->shpool->mutex);
 }
 
 ngx_flag_t
@@ -448,7 +479,7 @@ ngx_buffer_cache_store_gather(
 	}
 
 	// allocate a buffer to hold the data
-	target_buffer = ngx_buffer_cache_get_free_buffer(sh, buffer_size);
+	target_buffer = ngx_buffer_cache_get_free_buffer(sh, buffer_size + 1);
 	if (target_buffer == NULL)
 	{
 		goto error;
@@ -456,6 +487,7 @@ ngx_buffer_cache_store_gather(
 
 	// initialize the entry
 	entry->state = CES_ALLOCATED;
+	entry->ref_count = 1;
 	entry->node.key = hash;
 	memcpy(entry->key, key, BUFFER_CACHE_KEY_SIZE);
 	entry->start_offset = target_buffer;
@@ -487,9 +519,11 @@ ngx_buffer_cache_store_gather(
 	{
 		target_buffer = ngx_copy(target_buffer, cur_buffer->data, cur_buffer->len);
 	}
+	*target_buffer = '\0';
 
 	// Note: no need to obtain the lock since state is ngx_atomic_t
 	entry->state = CES_READY;
+	(void)ngx_atomic_fetch_add(&entry->ref_count, -1);
 
 	return 1;
 

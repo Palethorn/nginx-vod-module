@@ -29,6 +29,12 @@ ngx_log_error_core(ngx_uint_t level, ngx_log_t *log, ngx_err_t err,
 {
 }
 
+void ngx_cdecl
+ngx_conf_log_error(ngx_uint_t level, ngx_conf_t *cf, ngx_err_t err,
+	const char *fmt, ...)
+{
+}
+
 void
 ngx_shmtx_lock(ngx_shmtx_t *mtx)
 {
@@ -46,9 +52,12 @@ ngx_shared_memory_add(ngx_conf_t *cf, ngx_str_t *name, size_t size, void *tag)
 }
 
 // buffer cache initialization
-ngx_flag_t
+static ngx_flag_t
 init_buffer_cache(size_t size)
 {
+	ngx_conf_t cf;
+	ngx_log_t log;
+
 	ngx_time.sec = 0;
 	ngx_memzero(&shm_zone, sizeof(shm_zone));
 	shm_zone.shm.size = size;
@@ -57,12 +66,18 @@ init_buffer_cache(size_t size)
 	{
 		return 0;
 	}
-	ngx_buffer_cache_create_zone(NULL, NULL, 0, NULL);
+
+	ngx_memzero(&cf, sizeof(cf));
+	ngx_memzero(&log, sizeof(log));
+	cf.log = &log;
+	cf.pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, &log);
+	ngx_buffer_cache_create(&cf, NULL, 0, 0, NULL);
+
 	shm_zone.init(&shm_zone, NULL);
 	return 1;
 }
 
-void
+static void
 free_buffer_cache()
 {
 	free(shm_zone.shm.addr);
@@ -84,7 +99,7 @@ void print_queue(ngx_queue_t* queue, const char* name, u_char* relative_offset)
 	}
 }
 
-void print_cache_status(ngx_buffer_cache_t *cache)
+void print_cache_status(ngx_buffer_cache_sh_t *cache)
 {
 	printf("ES=%lx EE=%lx BS=%lx BW=%lx BR=%lx BE=%lx\n", 
 		(u_char*)cache->entries_start - (u_char*)cache->entries_start,
@@ -141,7 +156,7 @@ int run_test_cycle(time_t seed, size_t cache_size, int iterations, int size_fact
 {
 	ngx_buffer_cache_stats_t stats;
 	u_char key[BUFFER_CACHE_KEY_SIZE];
-	u_char* fetch_buffer;
+	ngx_str_t fetch_buffer;
 	u_char* store_buffer;
 	size_t* sizes_buffer;
 	size_t size;
@@ -175,15 +190,15 @@ int run_test_cycle(time_t seed, size_t cache_size, int iterations, int size_fact
 
 	for (i = 0; i < iterations; i++)
 	{
+		ngx_buffer_cache_sh_t *sh;
 		ngx_buffer_cache_t *cache;
-		ngx_slab_pool_t *shpool;
 
-		shpool = (ngx_slab_pool_t *)shm_zone.shm.addr;
-		cache = shpool->data;
+		cache = shm_zone.data;
+		sh = cache->sh;
 
 #ifdef VERBOSE
 		printf("%d. ", i);
-		print_cache_status(cache);
+		print_cache_status(sh);
 #endif
 
 		ngx_time.sec += ENTRY_LOCK_EXPIRATION + 1;
@@ -194,10 +209,10 @@ int run_test_cycle(time_t seed, size_t cache_size, int iterations, int size_fact
 #ifdef VERBOSE
 			printf("resetting the cache\n");
 #endif
-			cache->reset = 1;
+			sh->reset = 1;
 		}
 		
-		max_size = (cache->buffers_end - (u_char*)(cache->entries_end + ENTRIES_ALLOC_MARGIN + 1) - BUFFER_ALIGNMENT) / size_factor;
+		max_size = (sh->buffers_end - (u_char*)(sh->entries_end + ENTRIES_ALLOC_MARGIN + 1) - BUFFER_ALIGNMENT) / size_factor;
 		size = RAND(0, max_size);
 		sizes_buffer[i] = size;
 		generate_random_buffer(i, store_buffer, size);
@@ -206,7 +221,7 @@ int run_test_cycle(time_t seed, size_t cache_size, int iterations, int size_fact
 		printf("storing size=%zx\n", size);
 #endif
 				
-		if (!ngx_buffer_cache_store(&shm_zone, key, store_buffer, size))
+		if (!ngx_buffer_cache_store(cache, key, store_buffer, size))
 		{
 			printf("Error: store failed\n");
 			return 0;
@@ -215,15 +230,15 @@ int run_test_cycle(time_t seed, size_t cache_size, int iterations, int size_fact
 		for (j = min_existing_index; j <= i; j++)
 		{
 			((uint32_t*)&key)[0] = j;
-			if (ngx_buffer_cache_fetch(&shm_zone, key, &fetch_buffer, &size))
+			if (ngx_buffer_cache_fetch(cache, key, &fetch_buffer))
 			{
-				if (sizes_buffer[j] != size)
+				if (sizes_buffer[j] != fetch_buffer.len)
 				{
 					printf("Error: invalid buffer size\n");
 					return 0;
 				}
 				
-				if (!validate_random_buffer(j, fetch_buffer, size))
+				if (!validate_random_buffer(j, fetch_buffer.data, fetch_buffer.len))
 				{
 					printf("Error: invalid buffer content\n");
 					return 0;
@@ -239,7 +254,7 @@ int run_test_cycle(time_t seed, size_t cache_size, int iterations, int size_fact
 		printf("validated %d buffers\n", i + 1 - min_existing_index);
 #endif
 
-		ngx_buffer_cache_get_stats(&shm_zone, &stats);
+		ngx_buffer_cache_get_stats(cache, &stats);
 		if (stats.store_ok != i + 1)
 		{
 			printf("Error: invalid store_ok value, actual=%lu expected=%d\n", stats.store_ok, i + 1);

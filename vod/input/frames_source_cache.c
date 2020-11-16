@@ -37,13 +37,20 @@ frames_source_cache_set_cache_slot_id(void* ctx, int cache_slot_id)
 }
 
 static vod_status_t
-frames_source_cache_start_frame(void* ctx, input_frame_t* frame, uint64_t min_offset)
+frames_source_cache_start_frame(void* ctx, input_frame_t* frame, read_cache_hint_t* cache_hint)
 {
 	frames_source_cache_state_t* state = ctx;
 
 	state->req.cur_offset = frame->offset;
 	state->req.end_offset = frame->offset + frame->size;
-	state->req.min_offset = min_offset;
+	if (cache_hint != NULL)
+	{
+		state->req.hint = *cache_hint;
+	}
+	else
+	{
+		state->req.hint.min_offset = ULLONG_MAX;
+	}
 
 	return VOD_OK;
 }
@@ -86,10 +93,17 @@ frames_source_cache_disable_buffer_reuse(void* ctx)
 	read_cache_disable_buffer_reuse(state->read_cache_state);
 }
 
+static vod_status_t
+frames_source_cache_skip_frames(void* ctx, uint32_t skip_count)
+{
+	return VOD_OK;
+}
+
 // globals
 frames_source_t frames_source_cache = {
 	frames_source_cache_set_cache_slot_id,
 	frames_source_cache_start_frame,
 	frames_source_cache_read,
 	frames_source_cache_disable_buffer_reuse,
+	frames_source_cache_skip_frames,
 };

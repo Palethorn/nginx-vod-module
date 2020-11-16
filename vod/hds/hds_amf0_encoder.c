@@ -1,5 +1,5 @@
 #include "hds_amf0_encoder.h"
-#include "../mp4/mp4_builder.h"
+#include "../write_stream.h"
 
 // amf types
 #define AMF0_TYPE_NUMBER		(0x00)
@@ -28,7 +28,7 @@ static const vod_str_t amf0_on_metadata = vod_string("onMetaData");
 
 #define AMF0_FIELD(group, name, type)    group + 
 
-const int amf0_field_count =
+static const int amf0_field_count =
 #include "hds_amf0_fields_x.h"
 0;
 

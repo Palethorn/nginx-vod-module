@@ -75,8 +75,28 @@ def getHlsMasterPlaylistUrls(baseUrl, urlContent, headers):
 		result += getHlsMediaPlaylistUrls(curBaseUrl, mediaContent)
 	return result
 
-def parseDashInterval(interval):
-	return int(float(interval[2:-1]) * 1000)		# strip the PT / S
+def parseDashInterval(ts):
+	if not ts.startswith('PT'):
+		return 0
+	ts = ts[2:]
+	result = 0
+	while len(ts) > 0:
+		mul = None
+		for pos in xrange(len(ts)):
+			if ts[pos] == 'H':
+				mul = 3600
+			elif ts[pos] == 'M':
+				mul = 60
+			elif ts[pos] == 'S':
+				mul = 1
+			if mul != None:
+				break
+		if pos <= 0 or pos >= len(ts):
+			return 0
+		value = float(ts[:pos])
+		result += value * mul * 1000
+		ts = ts[(pos + 1):]
+	return int(result)
 
 def parseDashDate(date):
 	return int(calendar.timegm(time.strptime(date,'%Y-%m-%dT%H:%M:%SZ')) * 1000)
@@ -144,18 +164,28 @@ def getDashManifestUrls(baseUrl, urlContent, headers):
 		repIds = set([])
 		for node in base.getElementsByTagName('Representation'):
 			atts = getAttributesDict(node)
-			repIds.add(atts['id'])
+			repIds.add((atts['id'], atts['bandwidth']))
 			
 		# get the segment count from SegmentTimeline
 		segmentCount = None
+		segmentTimes = []
+		curTime = 0
 		for node in base.getElementsByTagName('SegmentTimeline'):
 			segmentCount = 0
 			for childNode in node.childNodes:
 				if childNode.nodeType == node.ELEMENT_NODE and childNode.nodeName == 'S':
 					atts = getAttributesDict(childNode)
+					repeatCount = 1
 					if atts.has_key('r'):
-						segmentCount += int(atts['r'])
-					segmentCount += 1
+						repeatCount += int(atts['r'])
+					if atts.has_key('t'):
+						curTime = int(atts['t'])
+					if atts.has_key('d'):
+						duration = int(atts['d'])
+						for _ in xrange(repeatCount):
+							segmentTimes.append(curTime)
+							curTime += duration
+					segmentCount += repeatCount
 
 		if segmentCount == None:
 			if segmentDuration == None:
@@ -196,36 +226,46 @@ def getDashManifestUrls(baseUrl, urlContent, headers):
 			segmentCount = (periodEndTime - periodStartTime) / segmentDuration - startNumber
 		
 		for url in initUrls:
-			for repId in repIds:
-				result.append(getAbsoluteUrl(url.replace('$RepresentationID$', repId)))
+			for repId, bandwidth in repIds:
+				curUrl = url.replace('$RepresentationID$', repId)
+				curUrl = curUrl.replace('$Bandwidth$', bandwidth)
+				result.append(getAbsoluteUrl(curUrl, baseUrl))
 		for url in mediaUrls:
-			for curSeg in xrange(startNumber, startNumber + segmentCount):
-				for repId in repIds:
-					result.append(getAbsoluteUrl(url.replace('$Number$', '%s' % (curSeg + 1)).replace('$RepresentationID$', repId)))
+			for curSeg in xrange(segmentCount):
+				for repId, bandwidth in repIds:
+					curUrl = url.replace('$Number$', '%s' % (startNumber + curSeg + 1))
+					if len(segmentTimes) > 0:
+						curUrl = curUrl.replace('$Time$', '%s' % (segmentTimes[curSeg]))
+					curUrl = curUrl.replace('$RepresentationID$', repId)
+					curUrl = curUrl.replace('$Bandwidth$', bandwidth)
+					result.append(getAbsoluteUrl(curUrl, baseUrl))
 
 	result = filterChunkList(result)
 	return result
 
 def getHdsSegmentIndexes(data):
-    result = []
-    mediaTime = struct.unpack('>Q', data[0x15:0x1d])[0]
-    curPos = 0x5a
-    prevDuration = 0
-    while curPos < len(data):
-        index, timestamp, duration = struct.unpack('>LQL', data[curPos:(curPos + 0x10)])
+	result = []
+	mediaTime = struct.unpack('>Q', data[0x15:0x1d])[0]
+	curPos = 0x5a
+	prevDuration = 0
+	while curPos < len(data):
+		index, timestamp, duration = struct.unpack('>LQL', data[curPos:(curPos + 0x10)])
+		curPos += 0x10
+		if duration == 0:
+			curPos += 1
 
-        curPos += 0x10
-        if duration == 0:
-            curPos += 1
+		if prevDuration != 0:
+			if (index, timestamp, duration) == (0, 0, 0):
+				repeatCount = (mediaTime - prevTimestamp) / prevDuration
+			else:
+				repeatCount = index - prevIndex
+			result += range(prevIndex, prevIndex + repeatCount)
+		(prevIndex, prevTimestamp, prevDuration) = (index, timestamp, duration)
 
-        if prevDuration != 0:
-            if (index, timestamp, duration) == (0, 0, 0):
-                repeatCount = (mediaTime - prevTimestamp) / prevDuration
-            else:
-                repeatCount = index - prevIndex
-            result += range(prevIndex, prevIndex + repeatCount)
-        (prevIndex, prevTimestamp, prevDuration) = (index, timestamp, duration)
-    return result
+	if prevDuration != 0 and mediaTime > prevTimestamp:
+		repeatCount = (mediaTime - prevTimestamp) / prevDuration
+		result += range(prevIndex, prevIndex + repeatCount)
+	return result
 	
 def getHdsManifestUrls(baseUrl, urlContent, headers):
 	result = []
@@ -258,6 +298,7 @@ def getHdsManifestUrls(baseUrl, urlContent, headers):
 			continue
 		
 		url = atts['url']
+		url = url.split('?')[0]
 		fragments = []
 		for curSeg in segmentIndexes[bootstrapId]:
 			fragments.append(getAbsoluteUrl('%s/%sSeg1-Frag%s' % (baseUrl, url, curSeg)))
@@ -300,6 +341,7 @@ PARSER_BY_MIME_TYPE = {
 	'application/dash+xml': getDashManifestUrls,
 	'video/f4m': getHdsManifestUrls,
 	'application/vnd.apple.mpegurl': getHlsMasterPlaylistUrls,
+	'application/x-mpegurl': getHlsMasterPlaylistUrls,
 	'text/xml': getMssManifestUrls,
 }
 

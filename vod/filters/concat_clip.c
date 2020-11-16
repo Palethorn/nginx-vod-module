@@ -3,7 +3,7 @@
 #include "../parse_utils.h"
 
 // constants
-#define MAX_CONCAT_ELEMENTS (10000)
+#define MAX_CONCAT_ELEMENTS (65536)
 
 // typedefs
 typedef struct {
@@ -212,6 +212,8 @@ concat_clip_parse(
 		{
 			offset = 0;
 		}
+
+		offset -= context->clip_from;
 
 		min_index = UINT_MAX;
 		max_index = durations->count - 1;

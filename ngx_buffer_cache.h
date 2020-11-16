@@ -32,8 +32,13 @@ typedef struct {
 ngx_flag_t ngx_buffer_cache_fetch(
 	ngx_buffer_cache_t* cache,
 	u_char* key,
-	u_char** buffer,
-	size_t* buffer_size);
+	ngx_str_t* buffer,
+	uint32_t* token);
+
+void ngx_buffer_cache_release(
+	ngx_buffer_cache_t* cache,
+	u_char* key,
+	uint32_t token);
 
 ngx_flag_t ngx_buffer_cache_store(
 	ngx_buffer_cache_t* cache,

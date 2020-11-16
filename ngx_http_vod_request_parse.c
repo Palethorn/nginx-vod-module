@@ -136,7 +136,7 @@ ngx_http_vod_extract_uint32_token_reverse(u_char* start_pos, u_char* end_pos, ui
 	return end_pos;
 }
 
-u_char*
+static u_char*
 ngx_http_vod_extract_track_tokens(u_char* start_pos, u_char* end_pos, uint32_t* result)
 {
 	uint32_t stream_index;
@@ -221,17 +221,19 @@ ngx_http_vod_parse_uri_file_name(
 	uint32_t flags,
 	request_params_t* result)
 {
+	sequence_tracks_mask_t* sequence_tracks_mask_end;
+	sequence_tracks_mask_t* sequence_tracks_mask;
+	ngx_str_t* cur_sequence_id;
+	ngx_str_t* last_sequence_id;
 	uint32_t default_tracks_mask;
 	uint32_t* tracks_mask;
-	uint32_t* end_mask;
-	uint32_t* cur_mask;
 	uint32_t segment_index_shift;
-	uint32_t masks_per_sequence;
 	uint32_t sequence_index;
 	uint32_t clip_index;
 	uint32_t media_type;
 	uint32_t pts_delay;
 	uint32_t version;
+	bool_t tracks_mask_updated;
 	language_id_t lang_id;
 
 	default_tracks_mask = (flags & PARSE_FILE_NAME_MULTI_STREAMS_PER_TYPE) ? 0xffffffff : 1;
@@ -255,7 +257,7 @@ ngx_http_vod_parse_uri_file_name(
 		{
 			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 				"ngx_http_vod_parse_uri_file_name: failed to parse segment index");
-			return NGX_HTTP_BAD_REQUEST;
+			return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
 		}
 		result->segment_index--;		// convert to 0-based
 
@@ -271,7 +273,7 @@ ngx_http_vod_parse_uri_file_name(
 			{
 				ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 					"ngx_http_vod_parse_uri_file_name: failed to parse segment index shift");
-				return NGX_HTTP_BAD_REQUEST;
+				return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
 			}
 
 			result->segment_index += segment_index_shift;
@@ -294,7 +296,7 @@ ngx_http_vod_parse_uri_file_name(
 		{
 			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 				"ngx_http_vod_parse_uri_file_name: failed to parse clip index");
-			return NGX_HTTP_BAD_REQUEST;
+			return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
 		}
 
 		result->clip_index = clip_index - 1;
@@ -302,114 +304,147 @@ ngx_http_vod_parse_uri_file_name(
 		skip_dash(start_pos, end_pos);
 	}
 
-	// sequence id
-	if (*start_pos == 's')
-	{
-		start_pos++;		// skip the s
-
-		result->sequence_id.data = start_pos;
-
-		while (start_pos < end_pos && *start_pos != '-')
-		{
-			start_pos++;
-		}
-
-		result->sequence_id.len = start_pos - result->sequence_id.data;
-
-		skip_dash(start_pos, end_pos);
-	}
-
 	// sequence (file) index
-	if (*start_pos == 'f')
+	if (*start_pos == 'f' || *start_pos == 's')
 	{
-		tracks_mask = result->tracks_mask;
-		masks_per_sequence = 0;
 		result->sequences_mask = 0;
+		cur_sequence_id = result->sequence_ids;
+		last_sequence_id = cur_sequence_id + MAX_SEQUENCE_IDS;
+		sequence_tracks_mask = NULL;
+		sequence_tracks_mask_end = NULL;
+		tracks_mask_updated = FALSE;
 
 		for (;;)
 		{
-			start_pos++;		// skip the f
-
-			if (start_pos >= end_pos || *start_pos < '1' || *start_pos > '9')
+			if (*start_pos == 'f')
 			{
-				ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-					"ngx_http_vod_parse_uri_file_name: missing index following sequence selector");
-				return NGX_HTTP_BAD_REQUEST;
-			}
+				// sequence index
+				start_pos++;		// skip the f
 
-			sequence_index = *start_pos - '0';
-			start_pos++;		// skip the digit
-
-			if (start_pos < end_pos && *start_pos >= '0' && *start_pos <= '9')
-			{
-				sequence_index = sequence_index * 10 + *start_pos - '0';
-				if (sequence_index > MAX_SEQUENCES)
+				if (start_pos >= end_pos || *start_pos < '1' || *start_pos > '9')
 				{
 					ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-						"ngx_http_vod_parse_uri_file_name: sequence index too big");
-					return NGX_HTTP_BAD_REQUEST;
+						"ngx_http_vod_parse_uri_file_name: missing index following sequence selector");
+					return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
 				}
-				start_pos++;		// skip the digit
-			}
 
-			sequence_index--;		// Note: sequence_index cannot be 0 here
-			result->sequences_mask |= (1 << sequence_index);
+				sequence_index = *start_pos - '0';
+				start_pos++;		// skip the digit
+
+				if (start_pos < end_pos && *start_pos >= '0' && *start_pos <= '9')
+				{
+					sequence_index = sequence_index * 10 + *start_pos - '0';
+					if (sequence_index > MAX_SEQUENCES)
+					{
+						ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+							"ngx_http_vod_parse_uri_file_name: sequence index too big");
+						return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
+					}
+					start_pos++;		// skip the digit
+				}
+
+				sequence_index--;		// Note: sequence_index cannot be 0 here
+				result->sequences_mask |= (1 << sequence_index);
+			}
+			else
+			{
+				// sequence id
+				start_pos++;		// skip the s
+
+				if (cur_sequence_id >= last_sequence_id)
+				{
+					ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+						"ngx_http_vod_parse_uri_file_name: the number of sequence ids exceeds the limit");
+					return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
+				}
+
+				cur_sequence_id->data = start_pos;
+
+				while (start_pos < end_pos && *start_pos != '-')
+				{
+					start_pos++;
+				}
+
+				cur_sequence_id->len = start_pos - cur_sequence_id->data;
+
+				cur_sequence_id++;
+				sequence_index = -(cur_sequence_id - result->sequence_ids);
+			}
 
 			skip_dash(start_pos, end_pos);
 
+			// tracks spec
 			if (*start_pos == 'v' || *start_pos == 'a')
 			{
+				if (sequence_tracks_mask != NULL)
+				{
+					if (sequence_tracks_mask >= sequence_tracks_mask_end)
+					{
+						ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+							"ngx_http_vod_parse_uri_file_name: the number of track specs exceeds the limit");
+						return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
+					}
+
+					sequence_tracks_mask->index = sequence_index;
+					tracks_mask = sequence_tracks_mask->tracks_mask;
+					sequence_tracks_mask++;
+					result->sequence_tracks_mask_end = sequence_tracks_mask;
+				}
+				else
+				{
+					tracks_mask_updated = TRUE;
+					tracks_mask = result->tracks_mask;
+				}
+
 				start_pos = ngx_http_vod_extract_track_tokens(
 					start_pos, 
 					end_pos, 
-					tracks_mask + masks_per_sequence * sequence_index);
+					tracks_mask);
 				if (start_pos == NULL)
 				{
 					return NGX_OK;
 				}
 			}
 
-			if (*start_pos != 'f')
+			if (*start_pos != 'f' && *start_pos != 's')
 			{
 				break;
 			}
 
-			if (result->sequence_tracks_mask != NULL)
+			if (sequence_tracks_mask != NULL)
 			{
 				continue;
 			}
 
 			// more than one sequence, allocate the per sequence tracks mask
-			result->sequence_tracks_mask = ngx_palloc(r->pool, 
-				sizeof(result->sequence_tracks_mask[0]) * MEDIA_TYPE_COUNT * MAX_SEQUENCES);
-			if (result->sequence_tracks_mask == NULL)
+			sequence_tracks_mask = ngx_palloc(r->pool, 
+				sizeof(sequence_tracks_mask[0]) * MAX_SEQUENCE_TRACKS_MASKS);
+			if (sequence_tracks_mask == NULL)
 			{
 				ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 					"ngx_http_vod_parse_uri_file_name: ngx_palloc failed");
-				return NGX_HTTP_INTERNAL_SERVER_ERROR;
+				return ngx_http_vod_status_to_ngx_error(r, VOD_ALLOC_FAILED);
 			}
 
-			// initialize the mask with the default
-			cur_mask = result->sequence_tracks_mask;
-			end_mask = cur_mask + MEDIA_TYPE_COUNT * MAX_SEQUENCES;
-			for (; cur_mask < end_mask; cur_mask++)
+			sequence_tracks_mask_end = sequence_tracks_mask + MAX_SEQUENCE_TRACKS_MASKS;
+
+			result->sequence_tracks_mask = sequence_tracks_mask;
+			result->sequence_tracks_mask_end = sequence_tracks_mask;
+
+			if (tracks_mask_updated)
 			{
-				*cur_mask = default_tracks_mask;
+				// add the currently parsed mask to the array
+				sequence_tracks_mask->index = sequence_index;
+				ngx_memcpy(sequence_tracks_mask->tracks_mask, result->tracks_mask, sizeof(sequence_tracks_mask->tracks_mask));
+				sequence_tracks_mask++;
+				result->sequence_tracks_mask_end = sequence_tracks_mask;
+
+				// restore the global mask to the default
+				for (media_type = 0; media_type < MEDIA_TYPE_COUNT; media_type++)
+				{
+					result->tracks_mask[media_type] = default_tracks_mask;
+				}
 			}
-
-			// copy the currently parsed mask to its place
-			tracks_mask = result->sequence_tracks_mask + sequence_index * MEDIA_TYPE_COUNT;
-			ngx_memcpy(tracks_mask, result->tracks_mask, sizeof(tracks_mask[0]) * MEDIA_TYPE_COUNT);
-
-			// restore the global mask to the default
-			for (media_type = 0; media_type < MEDIA_TYPE_COUNT; media_type++)
-			{
-				result->tracks_mask[media_type] = default_tracks_mask;
-			}
-
-			// from now on, parse directly to the sequence tracks mask
-			tracks_mask = result->sequence_tracks_mask;
-			masks_per_sequence = MEDIA_TYPE_COUNT;
 		}
 	}
 	else if (*start_pos == 'v' || *start_pos == 'a')
@@ -432,7 +467,7 @@ ngx_http_vod_parse_uri_file_name(
 		{
 			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 				"ngx_http_vod_parse_uri_file_name: failed to parse pts delay");
-			return NGX_HTTP_BAD_REQUEST;
+			return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
 		}
 
 		result->pts_delay = pts_delay;
@@ -448,7 +483,7 @@ ngx_http_vod_parse_uri_file_name(
 		{
 			ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 				"ngx_http_vod_parse_uri_file_name: ngx_pnalloc failed");
-			return NGX_HTTP_INTERNAL_SERVER_ERROR;
+			return ngx_http_vod_status_to_ngx_error(r, VOD_ALLOC_FAILED);
 		}
 
 		ngx_memzero(result->langs_mask, LANG_MASK_SIZE);
@@ -456,24 +491,24 @@ ngx_http_vod_parse_uri_file_name(
 		for (;;)
 		{
 			start_pos++;		// skip the l
-			if (start_pos + LANG_ISO639_2_LEN > end_pos)
+			if (start_pos + LANG_ISO639_3_LEN > end_pos)
 			{
 				ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 					"ngx_http_vod_parse_uri_file_name: language specifier length must be 3 characters");
-				return NGX_HTTP_BAD_REQUEST;
+				return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
 			}
 
-			lang_id = lang_parse_iso639_2_code(iso639_2_str_to_int(start_pos));
+			lang_id = lang_parse_iso639_3_code(iso639_3_str_to_int(start_pos));
 			if (lang_id == 0)
 			{
 				ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 					"ngx_http_vod_parse_uri_file_name: failed to parse language specifier %*s", (size_t)3, start_pos);
-				return NGX_HTTP_BAD_REQUEST;
+				return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
 			}
 
 			vod_set_bit(result->langs_mask, lang_id);
 
-			start_pos += LANG_ISO639_2_LEN;
+			start_pos += LANG_ISO639_3_LEN;
 
 			skip_dash(start_pos, end_pos);
 
@@ -494,7 +529,7 @@ ngx_http_vod_parse_uri_file_name(
 		{
 			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 				"ngx_http_vod_parse_uri_file_name: failed to parse version");
-			return NGX_HTTP_BAD_REQUEST;
+			return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
 		}
 
 		result->version = version - 1;
@@ -504,7 +539,7 @@ ngx_http_vod_parse_uri_file_name(
 
 	ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 		"ngx_http_vod_parse_uri_file_name: did not consume the whole name");
-	return NGX_HTTP_BAD_REQUEST;
+	return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
 }
 
 static ngx_int_t
@@ -521,13 +556,13 @@ ngx_http_vod_parse_multi_uri(
 
 	result->prefix.data = uri->data;
 	result->prefix.len = uri->len;
+	result->postfix.data = NULL;
+	result->postfix.len = 0;
 
 	if (uri->len < multi_uri_suffix->len ||
 		ngx_memcmp(multi_uri_suffix->data, uri->data + uri->len - multi_uri_suffix->len, multi_uri_suffix->len) != 0)
 	{
 		// not a multi uri
-		result->postfix.data = NULL;
-		result->postfix.len = 0;
 		result->middle_parts[0].data = NULL;
 		result->middle_parts[0].len = 0;
 		result->parts_count = 1;
@@ -556,7 +591,7 @@ ngx_http_vod_parse_multi_uri(
 			{
 				ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 					"ngx_http_vod_parse_multi_uri: number of url parts exceeds the limit");
-				return NGX_HTTP_BAD_REQUEST;
+				return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
 			}
 
 			result->middle_parts[part_index].data = last_comma_pos;
@@ -627,10 +662,90 @@ ngx_http_vod_parse_tracks_param(ngx_str_t* value, void* output, int offset)
 	return NGX_OK;
 }
 
+static ngx_int_t
+ngx_http_vod_parse_time_shift_param(ngx_str_t* value, void* output, int offset)
+{
+	uint32_t* time_shift = (uint32_t*)((u_char*)output + offset);
+	uint32_t media_type;
+	uint32_t cur_shift;
+	u_char* cur_pos = value->data;
+	u_char* end_pos = cur_pos + value->len;
+	u_char* new_pos;
+
+	while (cur_pos < end_pos)
+	{
+		switch (*cur_pos)
+		{
+		case 'v':
+			media_type = MEDIA_TYPE_VIDEO;
+			break;
+
+		case 'a':
+			media_type = MEDIA_TYPE_AUDIO;
+			break;
+
+		case 's':
+			media_type = MEDIA_TYPE_SUBTITLE;
+			break;
+
+		default:
+			return NGX_HTTP_BAD_REQUEST;
+		}
+		cur_pos++;
+
+		new_pos = parse_utils_extract_uint32_token(cur_pos, end_pos, &cur_shift);
+		if (new_pos <= cur_pos)
+		{
+			return NGX_HTTP_BAD_REQUEST;
+		}
+
+		time_shift[media_type] = cur_shift;
+
+		if (new_pos >= end_pos)
+		{
+			break;
+		}
+
+		cur_pos = new_pos;
+		if (*cur_pos == '-')
+		{
+			cur_pos++;
+		}
+	}
+
+	return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_vod_parse_lang_param(ngx_str_t* value, void* output, int offset)
+{
+	media_clip_source_t* clip = output;
+	media_sequence_t* sequence = clip->sequence;
+	language_id_t result;
+
+	if (value->len < LANG_ISO639_3_LEN)
+	{
+		return NGX_HTTP_BAD_REQUEST;
+	}
+
+	result = lang_parse_iso639_3_code(iso639_3_str_to_int(value->data));
+	if (result == 0)
+	{
+		return NGX_HTTP_BAD_REQUEST;
+	}
+
+	sequence->language = result;
+	lang_get_native_name(result, &sequence->label);
+
+	return VOD_OK;
+}
+
 static ngx_http_vod_uri_param_def_t uri_param_defs[] = {
 	{ offsetof(ngx_http_vod_loc_conf_t, clip_to_param_name), "clip to", ngx_http_vod_parse_uint64_param, offsetof(media_clip_source_t, clip_to) },
 	{ offsetof(ngx_http_vod_loc_conf_t, clip_from_param_name), "clip from", ngx_http_vod_parse_uint64_param, offsetof(media_clip_source_t, clip_from) },
 	{ offsetof(ngx_http_vod_loc_conf_t, tracks_param_name), "tracks", ngx_http_vod_parse_tracks_param, offsetof(media_clip_source_t, tracks_mask) },
+	{ offsetof(ngx_http_vod_loc_conf_t, time_shift_param_name), "time shift", ngx_http_vod_parse_time_shift_param, offsetof(media_clip_source_t, time_shift) },
+	{ offsetof(ngx_http_vod_loc_conf_t, lang_param_name), "lang", ngx_http_vod_parse_lang_param, 0 },
 	{ offsetof(ngx_http_vod_loc_conf_t, speed_param_name), "speed", NULL, 0 },
 	{ -1, NULL, NULL, 0}
 };
@@ -638,6 +753,7 @@ static ngx_http_vod_uri_param_def_t uri_param_defs[] = {
 static ngx_http_vod_uri_param_def_t pd_uri_param_defs[] = {
 	{ offsetof(ngx_http_vod_loc_conf_t, clip_to_param_name), "clip to", ngx_http_vod_parse_uint64_param, offsetof(media_clip_source_t, clip_to) },
 	{ offsetof(ngx_http_vod_loc_conf_t, clip_from_param_name), "clip from", ngx_http_vod_parse_uint64_param, offsetof(media_clip_source_t, clip_from) },
+	{ offsetof(ngx_http_vod_loc_conf_t, tracks_param_name), "tracks", ngx_http_vod_parse_tracks_param, offsetof(media_clip_source_t, tracks_mask) },
 	{ -1, NULL, NULL, 0 }
 };
 
@@ -773,7 +889,7 @@ ngx_http_vod_extract_uri_params(
 	{
 		ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 			"ngx_http_vod_extract_uri_params: ngx_palloc failed (1)");
-		return NGX_HTTP_INTERNAL_SERVER_ERROR;
+		return ngx_http_vod_status_to_ngx_error(r, VOD_ALLOC_FAILED);
 	}
 	source_clip->stripped_uri.data = p;
 
@@ -828,7 +944,7 @@ ngx_http_vod_extract_uri_params(
 						&rate_filter);
 					if (rc != VOD_OK)
 					{
-						return ngx_http_vod_status_to_ngx_error(rc);
+						return ngx_http_vod_status_to_ngx_error(r, rc);
 					}
 
 					if (rate_filter->rate.num != rate_filter->rate.denom)
@@ -861,7 +977,7 @@ ngx_http_vod_extract_uri_params(
 	{
 		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 			"ngx_http_vod_extract_uri_params: clip from %uL is larger than clip to %uL", source_clip->clip_from, source_clip->clip_to);
-		return NGX_HTTP_BAD_REQUEST;
+		return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
 	}
 
 	p = ngx_copy(p, copy_start, end_pos - copy_start);
@@ -901,15 +1017,18 @@ ngx_http_vod_parse_uri_path(
 
 	media_set->uri = *uri;		// must save the uri before calling ngx_http_vod_parse_multi_uri as it may change
 
+	multi_uri.parts_count = 0;
+
 	rc = ngx_http_vod_parse_multi_uri(r, uri, multi_uri_suffix, &multi_uri);
 	if (rc != NGX_OK)
 	{
 		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-			"ngx_http_vod_parse_uri_path: ngx_http_vod_parse_multi_uri failed", rc);
+			"ngx_http_vod_parse_uri_path: ngx_http_vod_parse_multi_uri failed %i", rc);
 		return rc;
 	}
 
-	if (multi_uri.parts_count > 1)
+	if (multi_uri.parts_count > 1 && 
+		request_params->sequence_ids[0].len == 0)
 	{
 		sequences_mask = request_params->sequences_mask;
 		request_params->sequences_mask = 0xffffffff;	// reset the sequences mask so that it won't be applied again on the mapping request
@@ -926,7 +1045,7 @@ ngx_http_vod_parse_uri_path(
 	{
 		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 			"ngx_http_vod_parse_uri_path: request has no uris");
-		return NGX_HTTP_BAD_REQUEST;
+		return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
 	}
 
 	cur_sequence = ngx_palloc(r->pool,
@@ -935,7 +1054,7 @@ ngx_http_vod_parse_uri_path(
 	{
 		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 			"ngx_http_vod_parse_uri_path: ngx_palloc failed");
-		return NGX_HTTP_INTERNAL_SERVER_ERROR;
+		return ngx_http_vod_status_to_ngx_error(r, VOD_ALLOC_FAILED);
 	}
 	media_set->sequences = cur_sequence;
 
@@ -955,12 +1074,21 @@ ngx_http_vod_parse_uri_path(
 			continue;
 		}
 
+		cur_sequence->id.len = 0;
+		cur_sequence->language = 0;
+		cur_sequence->label.len = 0;
+		cur_sequence->first_key_frame_offset = 0;
+		cur_sequence->key_frame_durations = NULL;
+		cur_sequence->drm_info = NULL;
+		ngx_memzero(cur_sequence->bitrate, sizeof(cur_sequence->bitrate));
+		ngx_memzero(cur_sequence->avg_bitrate, sizeof(cur_sequence->avg_bitrate));
+
 		parts[1] = multi_uri.middle_parts[i];
 		rc = ngx_http_vod_merge_string_parts(r, parts, 3, &cur_uri);
 		if (rc != NGX_OK)
 		{
 			ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-				"ngx_http_vod_parse_uri_path: ngx_http_vod_merge_string_parts failed", rc);
+				"ngx_http_vod_parse_uri_path: ngx_http_vod_merge_string_parts failed %i", rc);
 			return rc;
 		}
 
@@ -968,7 +1096,7 @@ ngx_http_vod_parse_uri_path(
 		if (rc != NGX_OK)
 		{
 			ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-				"ngx_http_vod_parse_uri_path: ngx_http_vod_extract_uri_params failed", rc);
+				"ngx_http_vod_parse_uri_path: ngx_http_vod_extract_uri_params failed %i", rc);
 			return rc;
 		}
 
@@ -996,12 +1124,6 @@ ngx_http_vod_parse_uri_path(
 		cur_sequence->index = i;
 		cur_sequence->stripped_uri = cur_source->stripped_uri;
 		cur_sequence->mapped_uri = cur_source->stripped_uri;
-		cur_sequence->id.len = 0;
-		cur_sequence->language = 0;
-		cur_sequence->label.len = 0;
-		cur_sequence->first_key_frame_offset = 0;
-		cur_sequence->key_frame_durations = NULL;
-		cur_sequence->drm_info = NULL;
 
 		cur_source++;
 		cur_sequence++;
@@ -1014,7 +1136,7 @@ ngx_http_vod_parse_uri_path(
 	{
 		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 			"ngx_http_vod_parse_uri_path: request has no uris after track filtering");
-		return NGX_HTTP_BAD_REQUEST;
+		return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
 	}
 
 	media_set->sources_head = sources_head;

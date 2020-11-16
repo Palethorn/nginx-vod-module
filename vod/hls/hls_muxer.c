@@ -4,7 +4,14 @@
 #include "id3_encoder_filter.h"
 #include "hls_muxer.h"
 
+#if (VOD_HAVE_OPENSSL_EVP)
+#include "frame_encrypt_filter.h"
+#include "eac3_encrypt_filter.h"
+#endif // VOD_HAVE_OPENSSL_EVP
+
 #define ID3_TEXT_JSON_FORMAT "{\"timestamp\":%uL}%Z"
+#define ID3_TEXT_JSON_SEQUENCE_ID_PREFIX_FORMAT "{\"timestamp\":%uL,\"sequenceId\":\""
+#define ID3_TEXT_JSON_SEQUENCE_ID_SUFFIX "\"}"
 
 // from ffmpeg mpegtsenc
 #define DEFAULT_PES_HEADER_FREQ 16
@@ -17,7 +24,6 @@
 typedef struct {
 	media_track_t track;
 	input_frame_t frame;
-	u_char data[sizeof(ID3_TEXT_JSON_FORMAT) + VOD_INT64_LEN];
 } id3_track_t;
 
 struct id3_context_s {
@@ -52,7 +58,7 @@ hls_muxer_init_track(
 	{
 	case MEDIA_TYPE_VIDEO:
 		rc = mp4_to_annexb_set_media_info(
-			cur_stream->top_filter_context, 
+			&cur_stream->filter_context, 
 			&track->media_info);
 		if (rc != VOD_OK)
 		{
@@ -64,7 +70,7 @@ hls_muxer_init_track(
 		if (track->media_info.codec_id == VOD_CODEC_ID_AAC)
 		{
 			rc = adts_encoder_set_media_info(
-				cur_stream->top_filter_context,
+				&cur_stream->filter_context,
 				&track->media_info);
 			if (rc != VOD_OK)
 			{
@@ -108,9 +114,40 @@ hls_muxer_simulation_supported(
 }
 
 static vod_status_t
+hls_muxer_init_stream(
+	hls_muxer_state_t* state,
+	hls_mpegts_muxer_conf_t* conf,
+	hls_muxer_stream_state_t* stream,
+	media_track_t* track,
+	mpegts_encoder_init_streams_state_t* init_streams_state)
+{
+	vod_status_t rc;
+
+	stream->segment_limit = ULLONG_MAX;
+	stream->filter_context.request_context = state->request_context;
+	stream->filter_context.context[MEDIA_FILTER_MPEGTS] = &stream->mpegts_encoder_state;
+	stream->filter_context.context[MEDIA_FILTER_BUFFER] = NULL;
+
+	rc = mpegts_encoder_init(
+		&stream->filter,
+		&stream->mpegts_encoder_state,
+		init_streams_state,
+		track,
+		&state->queue,
+		conf->interleave_frames,
+		conf->align_frames);
+	if (rc != VOD_OK)
+	{
+		return rc;
+	}
+
+	return VOD_OK;
+}
+
+static vod_status_t
 hls_muxer_init_id3_stream(
 	hls_muxer_state_t* state,
-	hls_muxer_conf_t* conf,
+	hls_mpegts_muxer_conf_t* conf,
 	media_set_t* media_set,
 	mpegts_encoder_init_streams_state_t* init_streams_state)
 {
@@ -121,19 +158,21 @@ hls_muxer_init_id3_stream(
 	id3_track_t* last_track;
 	id3_track_t* cur_track;
 	vod_status_t rc;
+	vod_str_t* sequence_id;
+	u_char* p;
+	size_t sequence_id_escape;
+	size_t data_size;
 	int64_t timestamp;
 	void* frames_source_context;
 
 	cur_stream = state->last_stream;
 
-	// init the mpeg ts encoder
-	rc = mpegts_encoder_init(
-		&cur_stream->mpegts_encoder_state,
-		init_streams_state,
+	rc = hls_muxer_init_stream(
+		state,
+		conf,
+		cur_stream,
 		NULL,
-		&state->queue,
-		conf->interleave_frames,
-		conf->align_frames);
+		init_streams_state);
 	if (rc != VOD_OK)
 	{
 		return rc;
@@ -145,9 +184,25 @@ hls_muxer_init_id3_stream(
 		return VOD_OK;
 	}
 
+	// get the data size
+	sequence_id = &media_set->sequences[0].id;
+	if (sequence_id->len != 0)
+	{
+		sequence_id_escape = vod_escape_json(NULL, sequence_id->data, sequence_id->len);
+		data_size = sizeof(ID3_TEXT_JSON_SEQUENCE_ID_PREFIX_FORMAT) + VOD_INT64_LEN + 
+			sequence_id->len + sequence_id_escape +
+			sizeof(ID3_TEXT_JSON_SEQUENCE_ID_SUFFIX);
+	}
+	else
+	{
+		sequence_id_escape = 0;
+		data_size = sizeof(ID3_TEXT_JSON_FORMAT) + VOD_INT64_LEN;
+	}
+
 	// allocate the context
 	context = vod_alloc(state->request_context->pool, 
-		sizeof(*context) + sizeof(context->first_track[0]) * media_set->clip_count);
+		sizeof(*context) + 
+		(sizeof(context->first_track[0]) + data_size) * media_set->clip_count);
 	if (context == NULL)
 	{
 		vod_log_debug0(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
@@ -155,7 +210,10 @@ hls_muxer_init_id3_stream(
 		return VOD_ALLOC_FAILED;
 	}
 
-	context->first_track = (void*)(context + 1);
+	cur_track = (void*)(context + 1);
+	last_track = cur_track + media_set->clip_count;
+
+	p = (void*)last_track;
 
 	// init the memory frames source
 	rc = frames_source_memory_init(state->request_context, &frames_source_context);
@@ -165,8 +223,7 @@ hls_muxer_init_id3_stream(
 	}
 
 	// init the tracks
-	cur_track = context->first_track;
-	last_track = cur_track + media_set->clip_count;
+	context->first_track = cur_track;
 	ref_track = media_set->filtered_tracks;
 
 	for (; cur_track < last_track; cur_track++, ref_track += media_set->total_track_count)
@@ -190,14 +247,31 @@ hls_muxer_init_id3_stream(
 		dest_track->frames.frames_source_context = frames_source_context;
 
 		// init the frame
-		timestamp = ref_track->original_clip_time + 
+		cur_track->frame.offset = (uintptr_t)p;
+		timestamp = ref_track->original_clip_time +
 			hls_rescale_to_millis(ref_track->first_frame_time_offset);
-		cur_track->frame.size = vod_sprintf(cur_track->data, 
-			ID3_TEXT_JSON_FORMAT, timestamp) - cur_track->data;
+		if (sequence_id->len != 0)
+		{
+			p = vod_sprintf(p, ID3_TEXT_JSON_SEQUENCE_ID_PREFIX_FORMAT, timestamp);
+			if (sequence_id_escape)
+			{
+				p = (u_char*)vod_escape_json(p, sequence_id->data, sequence_id->len);
+			}
+			else
+			{
+				p = vod_copy(p, sequence_id->data, sequence_id->len);
+			}
+			p = vod_copy(p, ID3_TEXT_JSON_SEQUENCE_ID_SUFFIX, sizeof(ID3_TEXT_JSON_SEQUENCE_ID_SUFFIX));
+
+		}
+		else
+		{
+			p = vod_sprintf(p, ID3_TEXT_JSON_FORMAT, timestamp);
+		}
+		cur_track->frame.size = (uintptr_t)p - cur_track->frame.offset;
 		cur_track->frame.duration = 0;
 		cur_track->frame.key_frame = 1;
 		cur_track->frame.pts_delay = 0;
-		cur_track->frame.offset = (uintptr_t)&cur_track->data;
 	}
 
 	// init the first track
@@ -209,15 +283,8 @@ hls_muxer_init_id3_stream(
 
 	context->cur_track = context->first_track + 1;
 
-	// base initialization
-	cur_stream->segment_limit = ULLONG_MAX;
-	cur_stream->buffer_state = NULL;
-
 	// init the id3 encoder
-	id3_encoder_init(&context->encoder, &mpegts_encoder, &cur_stream->mpegts_encoder_state);
-
-	cur_stream->top_filter = &id3_encoder;
-	cur_stream->top_filter_context = &context->encoder;
+	id3_encoder_init(&context->encoder, &cur_stream->filter, &cur_stream->filter_context);
 
 	// update the state
 	state->last_stream++;
@@ -230,22 +297,17 @@ static vod_status_t
 hls_muxer_init_base(
 	hls_muxer_state_t* state,
 	request_context_t* request_context,
-	hls_muxer_conf_t* conf,
+	hls_mpegts_muxer_conf_t* conf,
 	hls_encryption_params_t* encryption_params,
 	uint32_t segment_index,
 	media_set_t* media_set,
-	write_callback_t write_callback,
-	void* write_context,
-	bool_t* simulation_supported, 
+	bool_t* simulation_supported,
 	vod_str_t* response_header)
 {
 	mpegts_encoder_init_streams_state_t init_streams_state;
 	media_track_t* track;
 	hls_muxer_stream_state_t* cur_stream;
-	const media_filter_t* next_filter;
-	void* next_filter_context;
 	vod_status_t rc;
-	bool_t reuse_buffers;
 
 	*simulation_supported = hls_muxer_simulation_supported(media_set, encryption_params);
 
@@ -257,39 +319,10 @@ hls_muxer_init_base(
 	state->media_set = media_set;
 	state->use_discontinuity = media_set->use_discontinuity;
 
-	if (encryption_params->type == HLS_ENC_AES_128)
-	{
-		rc = aes_cbc_encrypt_init(
-			&state->encrypted_write_context,
-			request_context,
-			write_callback,
-			write_context,
-			encryption_params->key,
-			encryption_params->iv);
-
-		write_callback = (write_callback_t)aes_cbc_encrypt_write;
-		write_context = state->encrypted_write_context;
-		reuse_buffers = TRUE;		// aes_cbc_encrypt allocates new buffers
-	}
-	else
-	{
-		state->encrypted_write_context = NULL;
-		reuse_buffers = FALSE;
-	}
-
-	// init the write queue
-	write_buffer_queue_init(
-		&state->queue,
-		request_context,
-		write_callback,
-		write_context,
-		reuse_buffers);
-
 	// init the packetizer streams and get the packet ids / stream ids
 	rc = mpegts_encoder_init_streams(
 		request_context,
 		encryption_params,
-		&state->queue,
 		&init_streams_state,
 		segment_index);
 	if (rc != VOD_OK)
@@ -303,7 +336,7 @@ hls_muxer_init_base(
 	if (state->first_stream == NULL)
 	{
 		vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
-			"hls_muxer_init_base: vod_alloc failed (1)");
+			"hls_muxer_init_base: vod_alloc failed");
 		return VOD_ALLOC_FAILED;
 	}
 
@@ -312,15 +345,12 @@ hls_muxer_init_base(
 	track = media_set->filtered_tracks;
 	for (cur_stream = state->first_stream; cur_stream < state->last_stream; cur_stream++, track++)
 	{
-		cur_stream->segment_limit = ULLONG_MAX;
-
-		rc = mpegts_encoder_init(
-			&cur_stream->mpegts_encoder_state,
-			&init_streams_state,
+		rc = hls_muxer_init_stream(
+			state,
+			conf,
+			cur_stream,
 			track,
-			&state->queue,
-			conf->interleave_frames,
-			conf->align_frames);
+			&init_streams_state);
 		if (rc != VOD_OK)
 		{
 			return rc;
@@ -329,114 +359,108 @@ hls_muxer_init_base(
 		switch (track->media_info.media_type)
 		{
 		case MEDIA_TYPE_VIDEO:
-			if (track->media_info.duration_millis > state->video_duration)
+			switch (media_set->segmenter_conf->manifest_duration_policy)
 			{
-				state->video_duration = track->media_info.duration_millis;
-			}
+			case MDP_MAX:
+				if (track->media_info.duration_millis > state->video_duration)
+				{
+					state->video_duration = track->media_info.duration_millis;
+				}
+				break;
 
-			cur_stream->buffer_state = NULL;
-			cur_stream->top_filter_context = vod_alloc(request_context->pool, sizeof(mp4_to_annexb_state_t));
-			if (cur_stream->top_filter_context == NULL)
-			{
-				vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
-					"hls_muxer_init_base: vod_alloc failed (2)");
-				return VOD_ALLOC_FAILED;
+			case MDP_MIN:
+				if (track->media_info.duration_millis > 0 &&
+					(state->video_duration == 0 || track->media_info.duration_millis < state->video_duration))
+				{
+					state->video_duration = track->media_info.duration_millis;
+				}
+				break;
 			}
 
 			rc = mp4_to_annexb_init(
-				cur_stream->top_filter_context,
-				request_context,
-				encryption_params,
-				&mpegts_encoder,
-				&cur_stream->mpegts_encoder_state);
+				&cur_stream->filter,
+				&cur_stream->filter_context,
+				encryption_params);
 			if (rc != VOD_OK)
 			{
 				return rc;
 			}
-
-			cur_stream->top_filter = &mp4_to_annexb;
 			break;
 
 		case MEDIA_TYPE_AUDIO:
 			if (conf->interleave_frames)
 			{
 				// frame interleaving enabled, just join several audio frames according to timestamp
-				cur_stream->buffer_state = NULL;
-
-				next_filter_context = vod_alloc(request_context->pool, sizeof(frame_joiner_t));
-				if (next_filter_context == NULL)
+				rc = frame_joiner_init(
+					&cur_stream->filter,
+					&cur_stream->filter_context);
+				if (rc != VOD_OK)
 				{
-					vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
-						"hls_muxer_init_base: vod_alloc failed (3)");
-					return VOD_ALLOC_FAILED;
+					return rc;
 				}
-
-				frame_joiner_init(next_filter_context, &mpegts_encoder, &cur_stream->mpegts_encoder_state);
-
-				next_filter = &frame_joiner;
 			}
 			else
 			{
 				// no frame interleaving, buffer the audio until it reaches a certain size / delay from video
-				cur_stream->buffer_state = vod_alloc(request_context->pool, sizeof(buffer_filter_t));
-				if (cur_stream->buffer_state == NULL)
-				{
-					vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
-						"hls_muxer_init_base: vod_alloc failed (4)");
-					return VOD_ALLOC_FAILED;
-				}
-
 				rc = buffer_filter_init(
-					cur_stream->buffer_state,
-					request_context,
-					&mpegts_encoder,
-					&cur_stream->mpegts_encoder_state,
+					&cur_stream->filter,
+					&cur_stream->filter_context,
 					conf->align_frames,
 					DEFAULT_PES_PAYLOAD_SIZE);
 				if (rc != VOD_OK)
 				{
 					return rc;
 				}
-
-				next_filter = &buffer_filter;
-				next_filter_context = cur_stream->buffer_state;
 			}
 
 			if (track->media_info.codec_id == VOD_CODEC_ID_AAC)
 			{
-				cur_stream->top_filter_context = vod_alloc(request_context->pool, sizeof(adts_encoder_state_t));
-				if (cur_stream->top_filter_context == NULL)
+				rc = adts_encoder_init(
+					&cur_stream->filter,
+					&cur_stream->filter_context);
+				if (rc != VOD_OK)
 				{
-					vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
-						"hls_muxer_init_base: vod_alloc failed (5)");
-					return VOD_ALLOC_FAILED;
+					return rc;
+				}
+			}
+
+#if (VOD_HAVE_OPENSSL_EVP)
+			if (encryption_params->type == HLS_ENC_SAMPLE_AES)
+			{
+				switch (track->media_info.codec_id)
+				{
+				case VOD_CODEC_ID_AAC:
+				case VOD_CODEC_ID_AC3:
+				case VOD_CODEC_ID_EAC3:
+					break;
+
+				default:
+					vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+						"hls_muxer_init_base: sample aes encryption is supported only for aac/ac3/eac3");
+					return VOD_BAD_REQUEST;
 				}
 
-				rc = adts_encoder_init(
-					cur_stream->top_filter_context,
-					request_context,
-					encryption_params,
-					next_filter,
-					next_filter_context);
+				rc = frame_encrypt_filter_init(
+					&cur_stream->filter,
+					&cur_stream->filter_context,
+					encryption_params);
 				if (rc != VOD_OK)
 				{
 					return rc;
 				}
 
-				cur_stream->top_filter = &adts_encoder;
-			}
-			else
-			{
-				if (encryption_params->type == HLS_ENC_SAMPLE_AES)
+				if (track->media_info.codec_id == VOD_CODEC_ID_EAC3)
 				{
-					vod_log_error(VOD_LOG_ERR, request_context->log, 0,
-						"hls_muxer_init_base: sample aes encryption is supported only for aac");
-					return VOD_BAD_REQUEST;
+					rc = eac3_encrypt_filter_init(
+						&cur_stream->filter,
+						&cur_stream->filter_context);
+					if (rc != VOD_OK)
+					{
+						return rc;
+					}
 				}
-
-				cur_stream->top_filter = next_filter;
-				cur_stream->top_filter_context = next_filter_context;
 			}
+#endif // VOD_HAVE_OPENSSL_EVP
 			break;
 		}
 
@@ -469,12 +493,13 @@ hls_muxer_init_base(
 vod_status_t
 hls_muxer_init_segment(
 	request_context_t* request_context,
-	hls_muxer_conf_t* conf,
+	hls_mpegts_muxer_conf_t* conf,
 	hls_encryption_params_t* encryption_params,
 	uint32_t segment_index,
 	media_set_t* media_set,
 	write_callback_t write_callback,
 	void* write_context,
+	bool_t reuse_buffers,
 	size_t* response_size,
 	vod_str_t* response_header,
 	hls_muxer_state_t** processor_state)
@@ -491,6 +516,14 @@ hls_muxer_init_segment(
 		return VOD_ALLOC_FAILED;
 	}
 
+	// init the write queue
+	write_buffer_queue_init(
+		&state->queue,
+		request_context,
+		write_callback,
+		write_context,
+		reuse_buffers);
+
 	rc = hls_muxer_init_base(
 		state, 
 		request_context, 
@@ -498,9 +531,7 @@ hls_muxer_init_segment(
 		encryption_params, 
 		segment_index, 
 		media_set, 
-		write_callback, 
-		write_context, 
-		&simulation_supported, 
+		&simulation_supported,
 		response_header);
 	if (rc != VOD_OK)
 	{
@@ -514,6 +545,7 @@ hls_muxer_init_segment(
 		{
 			return rc;
 		}
+
 		hls_muxer_simulation_reset(state);
 	}
 
@@ -530,19 +562,6 @@ hls_muxer_init_segment(
 	else
 	{
 		*processor_state = state;
-	}
-
-	if (state->encrypted_write_context != NULL)
-	{
-		rc = aes_cbc_encrypt(
-			state->encrypted_write_context,
-			response_header,
-			response_header,
-			*processor_state == NULL);
-		if (rc != VOD_OK)
-		{
-			return rc;
-		}
 	}
 
 	return VOD_OK;
@@ -647,12 +666,12 @@ hls_muxer_start_frame(hls_muxer_state_t* state)
 {
 	hls_muxer_stream_state_t* cur_stream;
 	hls_muxer_stream_state_t* selected_stream;
+	read_cache_hint_t cache_hint;
 	output_frame_t output_frame;
 	input_frame_t* cur_frame;
 	uint64_t cur_frame_time_offset;
 	uint64_t cur_frame_dts;
 	uint64_t buffer_dts;
-	uint64_t min_offset;
 	vod_status_t rc;
 
 	rc = hls_muxer_choose_stream(state, &selected_stream);
@@ -674,7 +693,7 @@ hls_muxer_start_frame(hls_muxer_state_t* state)
 	state->last_stream_frame = selected_stream->cur_frame >= selected_stream->cur_frame_part.last_frame && 
 		selected_stream->cur_frame_part.next == NULL;
 
-	min_offset = ULLONG_MAX;
+	cache_hint.min_offset = ULLONG_MAX;
 
 	for (cur_stream = state->first_stream; cur_stream < state->last_stream; cur_stream++)
 	{
@@ -684,12 +703,12 @@ hls_muxer_start_frame(hls_muxer_state_t* state)
 		}
 
 		// flush any buffered frames if their delay becomes too big
-		if (cur_stream->buffer_state != NULL)
+		if (cur_stream->filter_context.context[MEDIA_FILTER_BUFFER] != NULL)
 		{
-			if (buffer_filter_get_dts(cur_stream->buffer_state, &buffer_dts) &&
+			if (buffer_filter_get_dts(&cur_stream->filter_context, &buffer_dts) &&
 				cur_frame_dts > buffer_dts + HLS_DELAY / 2)
 			{
-				rc = buffer_filter_force_flush(cur_stream->buffer_state, FALSE);
+				rc = buffer_filter_force_flush(&cur_stream->filter_context, FALSE);
 				if (rc != VOD_OK)
 				{
 					return rc;
@@ -700,16 +719,17 @@ hls_muxer_start_frame(hls_muxer_state_t* state)
 		// find the min offset
 		cur_frame = cur_stream->cur_frame;
 		if (cur_frame < cur_stream->cur_frame_part.last_frame &&
-			cur_frame->offset < min_offset && 
+			cur_frame->offset < cache_hint.min_offset &&
 			cur_stream->source == selected_stream->source)
 		{
-			min_offset = cur_frame->offset;
+			cache_hint.min_offset = cur_frame->offset;
+			cache_hint.min_offset_slot_id = cur_stream->mpegts_encoder_state.stream_info.pid;
 		}
 	}
 
 	// set the current top_filter
-	state->cur_writer = selected_stream->top_filter;
-	state->cur_writer_context = selected_stream->top_filter_context;
+	state->cur_writer = &selected_stream->filter;
+	state->cur_writer_context = &selected_stream->filter_context;
 
 	// initialize the mpeg ts frame info
 	output_frame.pts = cur_frame_time_offset + state->cur_frame->pts_delay;
@@ -721,7 +741,7 @@ hls_muxer_start_frame(hls_muxer_state_t* state)
 	state->cache_slot_id = selected_stream->mpegts_encoder_state.stream_info.pid;
 
 	// start the frame
-	rc = state->frames_source->start_frame(state->frames_source_context, state->cur_frame, min_offset);
+	rc = state->frames_source->start_frame(state->frames_source_context, state->cur_frame, &cache_hint);
 	if (rc != VOD_OK)
 	{
 		return rc;
@@ -832,15 +852,6 @@ hls_muxer_process(hls_muxer_state_t* state)
 		return rc;
 	}
 
-	if (state->encrypted_write_context != NULL)
-	{
-		rc = aes_cbc_encrypt_flush(state->encrypted_write_context);
-		if (rc != VOD_OK)
-		{
-			return rc;
-		}
-	}
-
 	return VOD_OK;
 }
 
@@ -855,19 +866,19 @@ hls_muxer_simulation_flush_delayed_streams(
 
 	for (cur_stream = state->first_stream; cur_stream < state->last_stream; cur_stream++)
 	{
-		if (selected_stream == cur_stream || cur_stream->buffer_state == NULL)
+		if (selected_stream == cur_stream || cur_stream->filter_context.context[MEDIA_FILTER_BUFFER] == NULL)
 		{
 			continue;
 		}
 
-		if (buffer_filter_get_dts(cur_stream->buffer_state, &buffer_dts) &&
+		if (buffer_filter_get_dts(&cur_stream->filter_context, &buffer_dts) &&
 			frame_dts > buffer_dts + HLS_DELAY / 2)
 		{
 			vod_log_debug2(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
 				"hls_muxer_simulation_flush_delayed_streams: flushing buffered frames buffer dts %L frame dts %L",
 				buffer_dts,
 				frame_dts);
-			buffer_filter_simulated_force_flush(cur_stream->buffer_state, FALSE);
+			buffer_filter_simulated_force_flush(&cur_stream->filter_context, FALSE);
 		}
 	}
 }
@@ -883,9 +894,9 @@ hls_muxer_simulation_write_frame(hls_muxer_stream_state_t* selected_stream, inpu
 	output_frame.key = cur_frame->key_frame;
 	output_frame.header_size = 0;
 
-	selected_stream->top_filter->simulated_start_frame(selected_stream->top_filter_context, &output_frame);
-	selected_stream->top_filter->simulated_write(selected_stream->top_filter_context, cur_frame->size);
-	selected_stream->top_filter->simulated_flush_frame(selected_stream->top_filter_context, last_frame);
+	selected_stream->filter.simulated_start_frame(&selected_stream->filter_context, &output_frame);
+	selected_stream->filter.simulated_write(&selected_stream->filter_context, cur_frame->size);
+	selected_stream->filter.simulated_flush_frame(&selected_stream->filter_context, last_frame);
 }
 
 static void 
@@ -920,7 +931,7 @@ vod_status_t
 hls_muxer_simulate_get_iframes(
 	request_context_t* request_context,
 	segment_durations_t* segment_durations,
-	hls_muxer_conf_t* muxer_conf,
+	hls_mpegts_muxer_conf_t* muxer_conf,
 	hls_encryption_params_t* encryption_params,
 	media_set_t* media_set,
 	hls_get_iframe_positions_callback_t callback,
@@ -948,7 +959,7 @@ hls_muxer_simulate_get_iframes(
 	vod_status_t rc;
 #if (VOD_DEBUG)
 	off_t cur_frame_start;
-#endif
+#endif // VOD_DEBUG
 	
 	cur_item = segment_durations->items;
 	last_item = segment_durations->items + segment_durations->item_count;
@@ -965,8 +976,6 @@ hls_muxer_simulate_get_iframes(
 		encryption_params,
 		0,
 		media_set,
-		NULL,
-		NULL,
 		&simulation_supported, 
 		NULL);
 	if (rc != VOD_OK)
@@ -1161,7 +1170,7 @@ hls_muxer_simulate_get_segment_size(hls_muxer_state_t* state, size_t* result)
 	vod_status_t rc;
 #if (VOD_DEBUG)
 	off_t cur_frame_start;
-#endif
+#endif // VOD_DEBUG
 
 	mpegts_encoder_simulated_start_segment(&state->queue);
 
@@ -1188,7 +1197,7 @@ hls_muxer_simulate_get_segment_size(hls_muxer_state_t* state, size_t* result)
 
 #if (VOD_DEBUG)
 		cur_frame_start = state->queue.cur_offset;
-#endif
+#endif // VOD_DEBUG
 		
 		// write the frame
 		hls_muxer_simulation_write_frame(
@@ -1208,14 +1217,10 @@ hls_muxer_simulate_get_segment_size(hls_muxer_state_t* state, size_t* result)
 				cur_frame_dts, 
 				selected_stream->mpegts_encoder_state.stream_info.pid);
 		}
-#endif
+#endif // VOD_DEBUG
 	}
 
 	segment_size = state->queue.cur_offset;
-	if (state->encrypted_write_context != NULL)
-	{
-		segment_size = aes_round_up_to_block(segment_size);
-	}
 
 	*result = segment_size;
 

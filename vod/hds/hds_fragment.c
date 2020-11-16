@@ -3,6 +3,7 @@
 #include "hds_amf0_encoder.h"
 #include "../write_buffer.h"
 #include "../mp4/mp4_defs.h"
+#include "../mp4/mp4_fragment.h"
 #include "../aes_defs.h"
 
 // adobe mux packet definitions
@@ -32,8 +33,8 @@
 #define AAC_PACKET_TYPE_SEQUENCE_HEADER (0)
 #define AAC_PACKET_TYPE_RAW 			(1)
 
-#define TRUN_SIZE_SINGLE_VIDEO_FRAME (ATOM_HEADER_SIZE + sizeof(trun_atom_t) + 4 * sizeof(uint32_t))
-#define TRUN_SIZE_SINGLE_AUDIO_FRAME (ATOM_HEADER_SIZE + sizeof(trun_atom_t) + 2 * sizeof(uint32_t))
+#define TRUN_SIZE_SINGLE_VIDEO_FRAME (ATOM_HEADER_SIZE + sizeof(trun_atom_t) + sizeof(trun_video_frame_t))
+#define TRUN_SIZE_SINGLE_AUDIO_FRAME (ATOM_HEADER_SIZE + sizeof(trun_atom_t) + sizeof(trun_audio_frame_t))
 
 #define HDS_AES_KEY_SIZE (16)
 
@@ -65,7 +66,7 @@ typedef struct {
 	u_char track_id[4];
 	u_char base_data_offset[8];
 	u_char sample_desc_index[4];
-} tfhd_atom_t;
+} hds_tfhd_atom_t;
 
 // frame tags
 typedef struct {
@@ -144,7 +145,7 @@ struct hds_muxer_state_s {
 #if (VOD_HAVE_OPENSSL_EVP)
 	u_char enc_key[HDS_AES_KEY_SIZE];
 	u_char enc_iv[AES_BLOCK_SIZE];
-	EVP_CIPHER_CTX cipher;
+	EVP_CIPHER_CTX* cipher;
 #endif //(VOD_HAVE_OPENSSL_EVP)
 };
 
@@ -153,20 +154,23 @@ typedef struct {
 	u_char iv[AES_BLOCK_SIZE];
 } hds_selective_encryption_filter_params_t;
 
+static vod_status_t hds_muxer_start_frame(hds_muxer_state_t* state);
+
+#if (VOD_HAVE_OPENSSL_EVP)
+
+#define ENCRYPTION_TAG_HEADER_SIZE sizeof(hds_encryption_tag_header)
+
 static u_char hds_encryption_tag_header[] = {
 	0x01,					// num filters
 	0x53, 0x45, 0x00,		// filter name (SE)
 	0x00, 0x00, 0x11,		// params len = sizeof(hds_selective_encryption_filter_params_t)
 };
 
-static vod_status_t hds_muxer_start_frame(hds_muxer_state_t* state);
-
-#if (VOD_HAVE_OPENSSL_EVP)
 ////// encryption functions
 static void
 hds_muxer_encrypt_cleanup(hds_muxer_state_t* state)
 {
-	EVP_CIPHER_CTX_cleanup(&state->cipher);
+	EVP_CIPHER_CTX_free(state->cipher);
 }
 
 static vod_status_t
@@ -184,10 +188,16 @@ hds_muxer_encrypt_init(
 		return VOD_ALLOC_FAILED;
 	}
 
+	state->cipher = EVP_CIPHER_CTX_new();
+	if (state->cipher == NULL)
+	{
+		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+			"hds_muxer_encrypt_init: EVP_CIPHER_CTX_new failed");
+		return VOD_ALLOC_FAILED;
+	}
+
 	cln->handler = (vod_pool_cleanup_pt)hds_muxer_encrypt_cleanup;
 	cln->data = state;
-
-	EVP_CIPHER_CTX_init(&state->cipher);
 
 	vod_memcpy(state->enc_key, encryption_params->key, sizeof(state->enc_key));
 	vod_memcpy(state->enc_iv, encryption_params->iv, sizeof(state->enc_iv));
@@ -201,7 +211,7 @@ hds_muxer_encrypt_init(
 static u_char*
 hds_muxer_encrypt_write_header(hds_muxer_state_t* state, u_char* p)
 {
-	p = vod_copy(p, hds_encryption_tag_header, sizeof(hds_encryption_tag_header));
+	p = vod_copy(p, hds_encryption_tag_header, ENCRYPTION_TAG_HEADER_SIZE);
 
 	// selective encryption filter params
 	*p++ = 0x80;		// packet is encrypted
@@ -214,7 +224,7 @@ static vod_status_t
 hds_muxer_encrypt_start_frame(hds_muxer_state_t* state)
 {
 	// reset the IV (it is ok to call EVP_EncryptInit_ex several times without cleanup)
-	if (1 != EVP_EncryptInit_ex(&state->cipher, EVP_aes_128_cbc(), NULL, state->enc_key, state->enc_iv))
+	if (1 != EVP_EncryptInit_ex(state->cipher, EVP_aes_128_cbc(), NULL, state->enc_key, state->enc_iv))
 	{
 		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
 			"hds_muxer_encrypt_start_frame: EVP_EncryptInit_ex failed");
@@ -255,7 +265,7 @@ hds_muxer_encrypt_write(
 			cur_size = buffer_end - buffer;
 		}
 
-		if (1 != EVP_EncryptUpdate(&state->cipher, out_buffer, &out_size, buffer, cur_size))
+		if (1 != EVP_EncryptUpdate(state->cipher, out_buffer, &out_size, buffer, cur_size))
 		{
 			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
 				"hds_muxer_encrypt_write: EVP_EncryptUpdate failed");
@@ -278,7 +288,7 @@ hds_muxer_encrypt_write(
 			return rc;
 		}
 
-		if (1 != EVP_EncryptFinal_ex(&state->cipher, out_buffer, &out_size))
+		if (1 != EVP_EncryptFinal_ex(state->cipher, out_buffer, &out_size))
 		{
 			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
 				"hds_muxer_encrypt_write: EVP_EncryptFinal_ex failed");
@@ -291,6 +301,8 @@ hds_muxer_encrypt_write(
 	return VOD_OK;
 }
 #else
+
+#define ENCRYPTION_TAG_HEADER_SIZE (0)
 
 // empty stubs
 static vod_status_t
@@ -473,7 +485,7 @@ hds_write_afra_atom_entry(u_char* p, uint64_t time, uint64_t offset)
 static u_char*
 hds_write_tfhd_atom(u_char* p, uint32_t track_id, uint64_t base_data_offset)
 {
-	size_t atom_size = ATOM_HEADER_SIZE + sizeof(tfhd_atom_t);
+	size_t atom_size = ATOM_HEADER_SIZE + sizeof(hds_tfhd_atom_t);
 
 	write_atom_header(p, atom_size, 't', 'f', 'h', 'd');
 	write_be32(p, 3);							// flags - base data offset | sample description
@@ -499,7 +511,7 @@ hds_write_single_video_frame_trun_atom(u_char* p, hds_encryption_type_t enc_type
 	atom_size = TRUN_SIZE_SINGLE_VIDEO_FRAME;
 
 	write_atom_header(p, atom_size, 't', 'r', 'u', 'n');
-	write_be32(p, 0xF01);				// flags = data offset, duration, size, key, delay
+	write_be32(p, TRUN_VIDEO_FLAGS);	// flags = data offset, duration, size, key, delay
 	write_be32(p, 1);					// frame count
 	write_be32(p, offset);				// offset from mdat start to frame raw data (excluding the tag)
 	write_be32(p, frame->duration);
@@ -532,7 +544,7 @@ hds_write_single_audio_frame_trun_atom(u_char* p, hds_encryption_type_t enc_type
 	atom_size = TRUN_SIZE_SINGLE_AUDIO_FRAME;
 
 	write_atom_header(p, atom_size, 't', 'r', 'u', 'n');
-	write_be32(p, 0x301);				// flags = data offset, duration, size
+	write_be32(p, TRUN_AUDIO_FLAGS);	// flags = data offset, duration, size
 	write_be32(p, 1);					// frame count
 	write_be32(p, offset);				// offset from mdat start to frame raw data (excluding the tag)
 	write_be32(p, frame->duration);
@@ -545,7 +557,7 @@ hds_get_traf_atom_size(hds_muxer_stream_state_t* cur_stream)
 {
 	size_t result;
 	
-	result = ATOM_HEADER_SIZE + ATOM_HEADER_SIZE + sizeof(tfhd_atom_t);
+	result = ATOM_HEADER_SIZE + ATOM_HEADER_SIZE + sizeof(hds_tfhd_atom_t);
 	switch (cur_stream->media_type)
 	{
 	case MEDIA_TYPE_VIDEO:
@@ -702,7 +714,7 @@ hds_calculate_output_offsets_and_write_afra_entries(
 	hds_muxer_state_t* state, 
 	uint32_t initial_value, 
 	uint32_t afra_entries_base, 
-	size_t* mdat_atom_size,
+	size_t* frames_size,
 	u_char** p)
 {
 	hds_muxer_stream_state_t* selected_stream;
@@ -741,7 +753,7 @@ hds_calculate_output_offsets_and_write_afra_entries(
 
 		if (state->enc_type != HDS_ENC_NONE)
 		{
-			cur_offset += sizeof(hds_encryption_tag_header);
+			cur_offset += ENCRYPTION_TAG_HEADER_SIZE;
 		}
 
 		// set the offset (points to the beginning of the actual data)
@@ -794,7 +806,7 @@ hds_calculate_output_offsets_and_write_afra_entries(
 		}
 	}
 
-	*mdat_atom_size = cur_offset;
+	*frames_size = cur_offset - initial_value;
 
 	return VOD_OK;
 }
@@ -1046,6 +1058,8 @@ hds_muxer_init_fragment(
 			return rc;
 		}
 
+		mdat_atom_size += mdat_header_size;
+
 		*total_fragment_size =
 			afra_atom_size +
 			moof_atom_size +
@@ -1079,11 +1093,18 @@ hds_muxer_init_fragment(
 		// afra
 		p = hds_write_afra_atom_header(p, afra_atom_size, video_key_frame_count);
 
-		rc = hds_calculate_output_offsets_and_write_afra_entries(state, mdat_header_size, afra_atom_size + moof_atom_size, &mdat_atom_size, &p);
+		rc = hds_calculate_output_offsets_and_write_afra_entries(
+			state, 
+			moof_atom_size + mdat_header_size, 
+			afra_atom_size, 
+			&mdat_atom_size, 
+			&p);
 		if (rc != VOD_OK)
 		{
 			return rc;
 		}
+
+		mdat_atom_size += mdat_header_size;
 
 		// calculate the total size now that we have the mdat size
 		*total_fragment_size =
@@ -1095,7 +1116,7 @@ hds_muxer_init_fragment(
 		write_atom_header(p, moof_atom_size, 'm', 'o', 'o', 'f');
 
 		// moof.mfhd
-		p = mp4_builder_write_mfhd_atom(p, segment_index);
+		p = mp4_fragment_write_mfhd_atom(p, segment_index);
 
 		for (cur_stream = state->first_stream; cur_stream < state->last_stream; cur_stream++)
 		{
@@ -1112,11 +1133,12 @@ hds_muxer_init_fragment(
 			case MEDIA_TYPE_VIDEO:
 				clip_index = 0;
 				cur_track = media_set->filtered_tracks + cur_stream->index;
+				output_offset = cur_stream->first_frame_output_offset;
 				for (;;)
 				{
 					part = &cur_track->frames;
 					last_frame = part->last_frame;
-					for (cur_frame = part->first_frame, output_offset = cur_stream->first_frame_output_offset; ;
+					for (cur_frame = part->first_frame; ;
 						cur_frame++, output_offset++)
 					{
 						if (cur_frame >= last_frame)
@@ -1145,11 +1167,12 @@ hds_muxer_init_fragment(
 			case MEDIA_TYPE_AUDIO:
 				clip_index = 0;
 				cur_track = media_set->filtered_tracks + cur_stream->index;
+				output_offset = cur_stream->first_frame_output_offset;
 				for (;;)
 				{
 					part = &cur_track->frames;
 					last_frame = part->last_frame;
-					for (cur_frame = part->first_frame, output_offset = cur_stream->first_frame_output_offset; ;
+					for (cur_frame = part->first_frame; ;
 						cur_frame++, output_offset++)
 					{
 						if (cur_frame >= last_frame)
@@ -1222,9 +1245,9 @@ hds_muxer_start_frame(hds_muxer_state_t* state)
 {
 	hds_muxer_stream_state_t* selected_stream;
 	hds_muxer_stream_state_t* cur_stream;
+	read_cache_hint_t cache_hint;
 	input_frame_t* cur_frame;
 	uint64_t cur_frame_dts;
-	uint64_t min_offset;
 	uint32_t frame_size;
 	size_t alloc_size;
 	u_char* p;
@@ -1259,10 +1282,10 @@ hds_muxer_start_frame(hds_muxer_state_t* state)
 	if (state->enc_type != HDS_ENC_NONE)
 	{
 		frame_size = 
-			sizeof(hds_encryption_tag_header) +
+			ENCRYPTION_TAG_HEADER_SIZE +
 			sizeof(hds_selective_encryption_filter_params_t) +
 			aes_round_up_to_block(frame_size);
-		alloc_size += sizeof(hds_encryption_tag_header) + sizeof(hds_selective_encryption_filter_params_t);
+		alloc_size += ENCRYPTION_TAG_HEADER_SIZE + sizeof(hds_selective_encryption_filter_params_t);
 	}
 
 	state->frame_header_size = selected_stream->tag_size;
@@ -1329,7 +1352,7 @@ hds_muxer_start_frame(hds_muxer_state_t* state)
 	}
 
 	// find the min offset
-	min_offset = ULLONG_MAX;
+	cache_hint.min_offset = ULLONG_MAX;
 
 	for (cur_stream = state->first_stream; cur_stream < state->last_stream; cur_stream++)
 	{
@@ -1340,14 +1363,15 @@ hds_muxer_start_frame(hds_muxer_state_t* state)
 
 		cur_frame = cur_stream->cur_frame;
 		if (cur_frame < cur_stream->cur_frame_part.last_frame &&
-			cur_frame->offset < min_offset &&
+			cur_frame->offset < cache_hint.min_offset &&
 			cur_stream->source == selected_stream->source)
 		{
-			min_offset = cur_frame->offset;
+			cache_hint.min_offset = cur_frame->offset;
+			cache_hint.min_offset_slot_id = cur_stream->media_type;
 		}
 	}
 
-	rc = state->frames_source->start_frame(state->frames_source_context, state->cur_frame, min_offset);
+	rc = state->frames_source->start_frame(state->frames_source_context, state->cur_frame, &cache_hint);
 	if (rc != VOD_OK)
 	{
 		return rc;
